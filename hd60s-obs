@@ -1,0 +1,87 @@
+#!/bin/sh
+# run the HD60 S into OBS.
+#
+# Default: straight into the OBS plugin.
+#
+#     start  ->  raw endpoint 0x83 byte stream
+#     demux  ->  1920x1080 YUY2 frames and 48 kHz stereo PCM
+#     plugin ->  the "Elgato HD60 S" source in OBS
+#
+# Add that source in OBS first, then run this. Ctrl-C stops it.
+#
+# With --udp it goes through ffmpeg to udp://127.0.0.1:9600 instead, for an OBS
+# media source. That path needs no plugin but costs an encode and some latency.
+#
+# --init runs the card's cold init first, which takes about 5 seconds and also
+# brings the HDMI passthrough back. Without it the card must already have been
+# configured by hand:
+#
+#     ./start replay data/cold-init-replay.txt
+set -e
+cd "$(dirname "$0")"
+
+MODE=obs
+INIT=
+for a in "$@"; do
+    case "$a" in
+        --udp)  MODE=udp ;;
+        --init) INIT=1 ;;
+    esac
+done
+URL="${HD60S_URL:-udp://127.0.0.1:9600?pkt_size=1316}"
+SOCK="${HD60S_SOCK:-/tmp/hd60s.sock}"
+
+# Only one capture can have the card: USBInterfaceOpen is exclusive, and a
+# second one fails with 0xe00002c5 while the first keeps the device. mkdir is
+# atomic, so it works as the lock.
+LOCK="${TMPDIR:-/tmp}/hd60s.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "another capture is already running (lock $LOCK). Remove it if that is wrong." >&2
+    exit 1
+fi
+
+cleanup() { kill -INT $ST 2>/dev/null; kill $FF $DX 2>/dev/null; rm -rf "$D" "$LOCK"; }
+trap cleanup EXIT INT TERM
+
+if [ -n "$INIT" ]; then
+    ./start replay data/cold-init-replay.txt
+fi
+
+D="${TMPDIR:-/tmp}/hd60s.$$"
+mkdir -p "$D"
+
+if [ "$MODE" = obs ]; then
+    mkfifo "$D/raw"
+    ./demux --obs "$SOCK" < "$D/raw" &
+    DX=$!
+    echo "sending to the OBS plugin on $SOCK"
+else
+    mkfifo "$D/raw" "$D/v" "$D/a"
+    # A small probesize on the audio input only. ffmpeg reads up to probesize
+    # from an input before it finishes opening it, and while it is doing that to
+    # the audio fifo it is not draining the video fifo, which fills in one
+    # sixtieth of a second and stops the demuxer. The same trick on the video
+    # input would shrink its AVIO buffer and break whole-frame reads.
+    ffmpeg -hide_banner -loglevel warning \
+      -thread_queue_size 64 -f rawvideo -pix_fmt yuyv422 -s 1920x1080 -r 60 -i "$D/v" \
+      -thread_queue_size 4096 -probesize 32 -analyzeduration 0 \
+      -f s16le -ar 48000 -ac 2 -i "$D/a" \
+      -c:v h264_videotoolbox -realtime 1 -b:v 25M -g 60 \
+      -c:a aac -b:a 192k \
+      -muxdelay 0 -muxpreload 0 -flush_packets 1 \
+      -f mpegts "$URL" &
+    FF=$!
+    ./demux --video "$D/v" --audio "$D/a" < "$D/raw" &
+    DX=$!
+    echo "sending to $URL"
+fi
+
+# Waiting on demux rather than on start is what makes the chain collapse when
+# OBS goes away: demux notices the socket close, exits, and takes the capture
+# with it. start does not die of SIGPIPE here because the frameworks it links
+# ignore that signal.
+./start stream 0 "$D/raw" &
+ST=$!
+wait $DX
+kill -INT $ST 2>/dev/null || true
+wait $ST 2>/dev/null || true

@@ -1,0 +1,13 @@
+
+archive/
+
+# build output
+start
+diag
+status
+demux
+*.o
+*.dSYM/
+build/
+obs-studio/
+.DS_Store
