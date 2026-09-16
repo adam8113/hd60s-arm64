@@ -28,6 +28,8 @@ PLUGIN  := $(HOME)/Library/Application Support/obs-studio/plugins/hd60s.plugin
 obs-plugin:
 	@test -f "$(OBS_SRC)/libobs/obs-module.h" || \
 	  { echo "set OBS_SRC to an obs-studio checkout"; exit 1; }
+	@test -d "$(OBS_APP)/Contents/Frameworks/libobs.framework" || \
+	  { echo "set OBS_APP to your OBS.app (tried $(OBS_APP))"; exit 1; }
 	mkdir -p "$(PLUGIN)/Contents/MacOS"
 	cp obs-plugin/Info.plist "$(PLUGIN)/Contents/Info.plist"
 	$(CC) -O2 -Wall -bundle -o "$(PLUGIN)/Contents/MacOS/hd60s" \
