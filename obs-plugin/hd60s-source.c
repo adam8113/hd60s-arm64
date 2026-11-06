@@ -53,8 +53,54 @@ struct hd60s {
     struct obs_source_frame frame;
     uint8_t *vbuf;
 
+    volatile int colour;    // COLOUR_*, from the source's properties
+    int colour_applied;     // what frame.color_matrix currently holds
+
     pid_t child;
 };
+
+// What the HDMI source sends. The card's colour stage is set up by the cold
+// init, which was captured from a YCbCr source, and it never looks at the AVI
+// InfoFrame. An RGB source (a Nintendo Switch, most consoles, some PCs) goes
+// through the same stage unconverted: green lands in the luma slot, blue in Cb
+// and red in Cr, each with its own gain and offset. On screen that is a green
+// picture where dark greys should be and pink where white should be.
+enum { COLOUR_YCBCR = 0, COLOUR_RGB = 1 };
+
+// Undo that for an RGB source. Rows are output R, G, B; columns are the Y, Cb,
+// Cr inputs (0..1) and an offset, which is how OBS's YUV_to_RGB reads them.
+// Each channel is mapped back with a straight line fitted to two neutral
+// points read off a Switch home screen captured through this driver: the dark
+// theme background (45) and white text (255). Fitted from one screenshot, so
+// treat it as close rather than exact; the right fix is programming the card's
+// own matrix from the InfoFrame, which needs an RGB source on the bench.
+static const float kRgbMatrix[16] = {
+    0.000000f, 0.000000f, 5.000000f, -1.960784f,  // R from Cr: 109..151 -> 45..255
+    1.909091f, 0.000000f, 0.000000f, -0.377540f,  // G from Y:   74..184 -> 45..255
+    0.000000f, 4.468085f, 0.000000f, -1.663330f,  // B from Cb: 105..152 -> 45..255
+    0.000000f, 0.000000f, 0.000000f,  1.000000f,
+};
+
+static void apply_colour(struct hd60s *h, int colour)
+{
+    if (colour == COLOUR_RGB) {
+        memcpy(h->frame.color_matrix, kRgbMatrix, sizeof kRgbMatrix);
+        for (int i = 0; i < 3; i++) {
+            h->frame.color_range_min[i] = 0.0f;
+            h->frame.color_range_max[i] = 1.0f;
+        }
+        h->frame.full_range = true;
+    } else {
+        // The card is BT.709 limited range; without this the picture comes out
+        // washed out and slightly green.
+        video_format_get_parameters(VIDEO_CS_709, VIDEO_RANGE_PARTIAL,
+                                    h->frame.color_matrix,
+                                    h->frame.color_range_min,
+                                    h->frame.color_range_max);
+        h->frame.full_range = false;
+    }
+    h->colour_applied = colour;
+}
 
 #ifndef HD60S_CAPTURE_CMD
 #define HD60S_CAPTURE_CMD "hd60s-obs"
@@ -82,6 +128,11 @@ static bool read_all(int fd, void *p, size_t n, volatile bool *quit)
 
 static void push_video(struct hd60s *h, const uint8_t *data, uint64_t ts)
 {
+    // Changed in properties on the UI thread; picked up here so the matrix is
+    // never rewritten while a frame is being handed to OBS.
+    int colour = h->colour;
+    if (colour != h->colour_applied) apply_colour(h, colour);
+
     h->frame.data[0] = (uint8_t *)data;
     h->frame.linesize[0] = HD60S_W * 2;
     h->frame.width = HD60S_W;
@@ -296,13 +347,8 @@ static void *hd60s_create(obs_data_t *settings, obs_source_t *source)
     h->sockpath = bstrdup(obs_data_get_string(settings, "socket"));
     h->vbuf = bmalloc(HD60S_W * 2 * HD60S_H);
 
-    // The card is BT.709 limited range; without this the picture comes out
-    // washed out and slightly green.
-    video_format_get_parameters(VIDEO_CS_709, VIDEO_RANGE_PARTIAL,
-                                h->frame.color_matrix,
-                                h->frame.color_range_min,
-                                h->frame.color_range_max);
-    h->frame.full_range = false;
+    h->colour = (int)obs_data_get_int(settings, "colour");
+    apply_colour(h, h->colour);
 
     // A source that cannot listen still exists, it just carries no picture.
     // Destroying it here would leave OBS with a dead scene item and no clue why.
@@ -319,12 +365,26 @@ static void hd60s_defaults(obs_data_t *settings)
     obs_data_set_default_string(settings, "socket", HD60S_SOCK_DEFAULT);
     obs_data_set_default_string(settings, "command", HD60S_CAPTURE_CMD);
     obs_data_set_default_bool(settings, "autostart", true);
+    obs_data_set_default_int(settings, "colour", COLOUR_YCBCR);
+}
+
+static void hd60s_update(void *data, obs_data_t *settings)
+{
+    struct hd60s *h = data;
+    h->colour = (int)obs_data_get_int(settings, "colour");
 }
 
 static obs_properties_t *hd60s_properties(void *data)
 {
     UNUSED_PARAMETER(data);
     obs_properties_t *p = obs_properties_create();
+    obs_property_t *c = obs_properties_add_list(p, "colour", "Input colour",
+                                                OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(c, "YCbCr (Mac, players)", COLOUR_YCBCR);
+    obs_property_list_add_int(c, "RGB (Switch)", COLOUR_RGB);
+    obs_property_set_long_description(c,
+        "If the picture is green where it should be dark grey and pink where it "
+        "should be white, the source is sending RGB. Pick RGB.");
     obs_properties_add_bool(p, "autostart", "Start the capture with this source");
     obs_properties_add_text(p, "command", "Capture command", OBS_TEXT_DEFAULT);
     obs_properties_add_text(p, "socket", "Socket path", OBS_TEXT_DEFAULT);
@@ -343,6 +403,7 @@ static struct obs_source_info hd60s_source_info = {
     .create = hd60s_create,
     .destroy = hd60s_destroy,
     .get_defaults = hd60s_defaults,
+    .update = hd60s_update,
     .get_properties = hd60s_properties,
     .icon_type = OBS_ICON_TYPE_CAMERA,
 };
