@@ -27,7 +27,8 @@ A user-space driver plus an OBS plugin that adds the card as a source with video
 Clone the tag matching the OBS you run. OBS bakes the API version of these
 headers into the plugin and refuses to load one built against a different
 major version. `OBS_APP` defaults to `/Applications/OBS.app`, pass it if yours
-is elsewhere.
+is elsewhere. `SIMDE=` overrides the Homebrew simde include path if yours is
+elsewhere.
 
 The plugin installs to `~/Library/Application Support/obs-studio/plugins`.
 Restart OBS and add the source "Elgato HD60 S". The source
@@ -36,8 +37,8 @@ remove the source. It takes about seven seconds to show a picture. If the pictur
 
 If the picture is green where it should be dark grey and pink where it should
 be white, your source is sending RGB rather than YCbCr. A Nintendo Switch always
-does. Open the source's properties and set "Input colour" to RGB. That option is
-a correction fitted from one capture, so colours are close but not exact yet.
+does. Open the source's properties and set "Input colour" to RGB. Fitted from
+one Switch capture — close, not exact.
 
 To drive it by hand, untick "Start the capture with this source" and run:
 

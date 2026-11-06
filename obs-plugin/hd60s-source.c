@@ -380,8 +380,8 @@ static obs_properties_t *hd60s_properties(void *data)
     obs_properties_t *p = obs_properties_create();
     obs_property_t *c = obs_properties_add_list(p, "colour", "Input colour",
                                                 OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(c, "YCbCr (iPad, Mac, most video players)", COLOUR_YCBCR);
-    obs_property_list_add_int(c, "RGB (Nintendo Switch, consoles, PCs)", COLOUR_RGB);
+    obs_property_list_add_int(c, "YCbCr (Mac, players)", COLOUR_YCBCR);
+    obs_property_list_add_int(c, "RGB (Switch)", COLOUR_RGB);
     obs_property_set_long_description(c,
         "If the picture is green where it should be dark grey and pink where it "
         "should be white, the source is sending RGB. Pick RGB.");
