@@ -23,6 +23,8 @@ demux: src/demux.c src/hd60s_ipc.h
 #   make obs-plugin OBS_SRC=obs-studio
 OBS_SRC ?= obs-studio
 OBS_APP ?= /Applications/OBS.app
+# libobs's headers include <simde/x86/sse2.h> on arm64: brew install simde
+SIMDE   ?= $(shell brew --prefix 2>/dev/null || echo /opt/homebrew)/opt/simde/include
 PLUGIN  := $(HOME)/Library/Application Support/obs-studio/plugins/hd60s.plugin
 
 obs-plugin:
@@ -30,10 +32,12 @@ obs-plugin:
 	  { echo "set OBS_SRC to an obs-studio checkout"; exit 1; }
 	@test -d "$(OBS_APP)/Contents/Frameworks/libobs.framework" || \
 	  { echo "set OBS_APP to your OBS.app (tried $(OBS_APP))"; exit 1; }
+	@test -f "$(SIMDE)/simde/x86/sse2.h" || \
+	  { echo "simde not found in $(SIMDE). Run: brew install simde"; exit 1; }
 	mkdir -p "$(PLUGIN)/Contents/MacOS"
 	cp obs-plugin/Info.plist "$(PLUGIN)/Contents/Info.plist"
 	$(CC) -O2 -Wall -bundle -o "$(PLUGIN)/Contents/MacOS/hd60s" \
-	  -I$(OBS_SRC)/libobs -Iobs-plugin/stub obs-plugin/hd60s-source.c \
+	  -I$(OBS_SRC)/libobs -I"$(SIMDE)" -Iobs-plugin/stub obs-plugin/hd60s-source.c \
 	  -DHD60S_CAPTURE_CMD='"$(CURDIR)/hd60s-obs"' \
 	  -F$(OBS_APP)/Contents/Frameworks -framework libobs
 	codesign --force --sign - "$(PLUGIN)"
