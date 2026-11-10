@@ -27,7 +27,7 @@ also checked capture.
 **Picture only (no capture):**
 
     ./start up         # wake (if needed) + colour from AVI InfoFrame
-    ./start restart    # USB re-enumerate + up, when the card is wedged
+    ./start restart    # USB re-enumerate + wake + bringup, when wedged
 
 **Capture / OBS:**
 

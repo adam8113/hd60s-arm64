@@ -48,6 +48,7 @@ static bool gNoP80 = false;
 static bool gArm = false, gPost = false;
 
 static int phaseReplay(const char* path, int maxOps);
+static int phaseBringup(const char* replayPath);
 
 // ---------------------------------------------------------------- transport
 
@@ -261,20 +262,46 @@ static bool iface0Visible() {
 }
 
 // After soft re-enumerate the device node can appear before its interfaces.
-static bool waitForIface0(int waitMs = 5000) {
-    const int step = 200;
+// Holding the device open sometimes prevents macOS from publishing them, so
+// the long wait releases between polls.
+static bool waitForIface0(int waitMs = 5000, bool releaseBetween = false) {
+    const int step = 250;
     for (int t = 0; t < waitMs; t += step) {
-        if (iface0Visible()) return true;
-        usleep((useconds_t)step * 1000);
+        if (gDev && iface0Visible()) return true;
+        if (releaseBetween) {
+            releaseDevice();
+            usleep((useconds_t)step * 1000);
+            if (!openDevice(true)) continue;
+        } else {
+            usleep((useconds_t)step * 1000);
+        }
     }
-    return iface0Visible();
+    return gDev && iface0Visible();
+}
+
+// When soft re-enumerate leaves the device with no interfaces, bouncing the
+// configuration sometimes makes the host publish them without a cable yank.
+static bool bounceConfiguration() {
+    if (!gDev) return false;
+    printf("  bouncing SetConfiguration(0)->(1) to publish interfaces\n");
+    IOReturn r0 = (*gDev)->SetConfiguration(gDev, 0);
+    usleep(300000);
+    IOReturn r1 = (*gDev)->SetConfiguration(gDev, 1);
+    printf("  SetConfiguration(0) -> 0x%08x, SetConfiguration(1) -> 0x%08x\n",
+           r0, r1);
+    return waitForIface0(5000, false);
 }
 
 static bool claimInterface0() {
     if (gIf) return true;
-    if (!waitForIface0(5000)) {
-        printf("  interface 0 not found (waited 5s after config). "
-               "Unplug/replug USB if a soft reset just ran.\n");
+    if (!waitForIface0(3000, false) && !bounceConfiguration() &&
+        !waitForIface0(5000, true)) {
+        printf("  interface 0 not found. Unplug/replug USB if a soft reset just ran.\n");
+        return false;
+    }
+    if (!gDev && !openDevice(true)) return false;
+    if (!iface0Visible() && !bounceConfiguration()) {
+        printf("  interface 0 not found. Unplug/replug USB if a soft reset just ran.\n");
         return false;
     }
     IOUSBFindInterfaceRequest rq = { kIOUSBFindInterfaceDontCare, kIOUSBFindInterfaceDontCare,
@@ -900,8 +927,14 @@ static int phaseReset(int waitMs = 12000) {
             printf("  card back after %.1fs, MCU answering\n",
                    (i * stepMs + 300) / 1000.0);
             printLinkSpeed();
-            if (!waitForIface0(5000))
-                printf("  warning: interface 0 not published yet; capture may need a USB replug\n");
+            // First try while held open; if that fails, release/reopen so the
+            // host can publish interface nodes (needed for capture).
+            if (!waitForIface0(3000, false) && !waitForIface0(12000, true))
+                printf("  warning: interface 0 not published; capture may need a USB replug\n");
+            else if (!iface0Visible())
+                ; // already warned
+            else
+                printf("  interface 0 published\n");
             return 0;
         }
         if (aw == -2) {
@@ -926,19 +959,24 @@ static int phaseReset(int waitMs = 12000) {
 
 // Wake + colour for passthrough. Skips the full cold-init replay (that path
 // resets the TX mid-way; use `replay` when you need capture).
-static int phaseUp() {
+// settleMs: extra wait before the first InfoFrame poll (HDMI re-lock after
+// re-enumerate is slower than a warm wake).
+static int phaseUp(int settleMs = 500) {
     printf("\n-- up: wake + colour (no cold-init replay) --\n");
     if (mcuRead(0x0e) < 0) {
         if (phaseWake() < 0) return 2;
     } else {
         printf("  MCU already answering, skipping wake\n");
     }
-    usleep(500000);   // front end needs a moment after wake before InfoFrame
+    if (settleMs > 0) {
+        printf("  waiting %.1fs for HDMI to settle\n", settleMs / 1000.0);
+        usleep((useconds_t)settleMs * 1000);
+    }
     int rc = phaseColour(0, 8000);
     if (rc == 1) {
-        printf("  no InfoFrame yet; retrying colour in 2s\n");
-        usleep(2000000);
-        rc = phaseColour(0, 5000);
+        printf("  no InfoFrame yet; retrying colour in 3s\n");
+        usleep(3000000);
+        rc = phaseColour(0, 8000);
         if (rc == 1) {
             printf("  up complete; colour deferred until a source is present\n");
             return 0;
@@ -947,14 +985,22 @@ static int phaseUp() {
     return rc;
 }
 
-// USB re-enumerate + up. Prefer ./start up when the card is already awake.
+// USB re-enumerate + full capture bring-up. Prefer ./start up when the card is
+// already awake and you only need the TV picture. Replay is safe for the TV
+// now that TX 0x20 is cleared at the end of phaseReplay.
 static int phaseRestart() {
     int rc = phaseReset();
     if (rc != 0) {
         printf("  reset did not restore the card; not continuing\n");
         return rc;
     }
-    return phaseUp();
+    // Always re-run wake after re-enumerate even if the MCU already answers:
+    // otherwise the front end may stay unlocked (no InfoFrame) while the TV
+    // still shows the source via hardware bypass.
+    printf("  re-running wake after re-enumerate\n");
+    if (phaseWake() < 0) return 2;
+    usleep(2000000);
+    return phaseBringup("data/cold-init-replay.txt");
 }
 
 // Capture bring-up in one shot: cold-init replay + colour.
@@ -1469,7 +1515,8 @@ static void usage() {
 "                        MCU. Use when the FX3/MCU is wedged.\n"
 "  up                    wake (if needed) + colour. Preferred bring-up: keeps a\n"
 "                        live passthrough. Do NOT use full replay for picture.\n"
-"  restart               reset + up. Soft recovery without a cable yank.\n"
+"  restart               reset + wake + bringup. Soft recovery without a cable\n"
+"                        yank (replay+colour after re-enumerate).\n"
 "  replay FILE [N]       verbatim cold-init capture. Needed for capture. Clears\n"
 "                        TX 0x20 afterwards (left at 0x01 the TV stays black).\n"
 "  bringup [FILE]        replay + colour. Default FILE is data/cold-init-replay.txt.\n"

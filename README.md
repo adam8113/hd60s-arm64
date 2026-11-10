@@ -46,7 +46,7 @@ using both corrects twice and looks wrong. Details: `docs/RGB_COLOUR.md`.
 Picture only (no capture):
 
     ./start up         # wake + colour
-    ./start restart    # USB re-enumerate + up, if the card is wedged
+    ./start restart    # USB re-enumerate + bringup, if the card is wedged
 
 Capture / OBS needs the cold-init replay first (wake+colour alone leaves the
 isoc pipe empty):
