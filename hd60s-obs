@@ -12,11 +12,12 @@
 # With --udp it goes through ffmpeg to udp://127.0.0.1:9600 instead, for an OBS
 # media source. That path needs no plugin but costs an encode and some latency.
 #
-# --init runs the card's cold init first, which takes about 5 seconds and also
-# brings the HDMI passthrough back. Without it the card must already have been
-# configured by hand:
+# --init runs ./start bringup (cold-init replay + colour). Without --init,
+# configure by hand:
 #
-#     ./start replay data/cold-init-replay.txt
+#     ./start bringup
+#     # picture-only (no capture): ./start up
+#     # wedged card: ./start restart
 set -e
 cd "$(dirname "$0")"
 
@@ -44,7 +45,9 @@ cleanup() { kill -INT $ST 2>/dev/null; kill $FF $DX 2>/dev/null; rm -rf "$D" "$L
 trap cleanup EXIT INT TERM
 
 if [ -n "$INIT" ]; then
-    ./start replay data/cold-init-replay.txt
+    if ! ./start bringup; then
+        echo "hd60s-obs: bringup failed; try ./start colour once the source is on" >&2
+    fi
 fi
 
 D="${TMPDIR:-/tmp}/hd60s.$$"

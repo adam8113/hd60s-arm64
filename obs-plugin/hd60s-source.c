@@ -59,21 +59,19 @@ struct hd60s {
     pid_t child;
 };
 
-// What the HDMI source sends. The card's colour stage is set up by the cold
-// init, which was captured from a YCbCr source, and it never looks at the AVI
-// InfoFrame. An RGB source (a Nintendo Switch, most consoles, some PCs) goes
-// through the same stage unconverted: green lands in the luma slot, blue in Cb
-// and red in Cr, each with its own gain and offset. On screen that is a green
-// picture where dark greys should be and pink where white should be.
+// What the HDMI source sends. hd60s-obs --init (replay + colour) / ./start
+// colour programs the card's front-end CSC from the AVI InfoFrame, so RGB
+// sources (Switch, PS5) arrive here as YCbCr. Leave Input colour on YCbCr.
+//
+// COLOUR_RGB is a legacy software undo for captures that skipped that hardware
+// step: green in luma, blue in Cb, red in Cr. Do not combine it with the
+// hardware CSC — that corrects twice.
 enum { COLOUR_YCBCR = 0, COLOUR_RGB = 1 };
 
-// Undo that for an RGB source. Rows are output R, G, B; columns are the Y, Cb,
-// Cr inputs (0..1) and an offset, which is how OBS's YUV_to_RGB reads them.
-// Each channel is mapped back with a straight line fitted to two neutral
-// points read off a Switch home screen captured through this driver: the dark
-// theme background (45) and white text (255). Fitted from one screenshot, so
-// treat it as close rather than exact; the right fix is programming the card's
-// own matrix from the InfoFrame, which needs an RGB source on the bench.
+// Legacy software undo for an RGB source that skipped hardware CSC. Rows are
+// output R, G, B; columns are the Y, Cb, Cr inputs (0..1) and an offset, which
+// is how OBS's YUV_to_RGB reads them. Fitted from one Switch home-screen
+// capture; close, not exact.
 static const float kRgbMatrix[16] = {
     0.000000f, 0.000000f, 5.000000f, -1.960784f,  // R from Cr: 109..151 -> 45..255
     1.909091f, 0.000000f, 0.000000f, -0.377540f,  // G from Y:   74..184 -> 45..255
@@ -380,11 +378,12 @@ static obs_properties_t *hd60s_properties(void *data)
     obs_properties_t *p = obs_properties_create();
     obs_property_t *c = obs_properties_add_list(p, "colour", "Input colour",
                                                 OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(c, "YCbCr (Mac, players)", COLOUR_YCBCR);
-    obs_property_list_add_int(c, "RGB (Switch)", COLOUR_RGB);
+    obs_property_list_add_int(c, "YCbCr (normal)", COLOUR_YCBCR);
+    obs_property_list_add_int(c, "RGB (legacy, no hardware CSC)", COLOUR_RGB);
     obs_property_set_long_description(c,
-        "If the picture is green where it should be dark grey and pink where it "
-        "should be white, the source is sending RGB. Pick RGB.");
+        "Leave YCbCr when using hd60s-obs --init / ./start colour: the card "
+        "converts RGB sources in hardware. Pick RGB only for an old capture "
+        "path that skipped that step. Using both corrects twice.");
     obs_properties_add_bool(p, "autostart", "Start the capture with this source");
     obs_properties_add_text(p, "command", "Capture command", OBS_TEXT_DEFAULT);
     obs_properties_add_text(p, "socket", "Socket path", OBS_TEXT_DEFAULT);
