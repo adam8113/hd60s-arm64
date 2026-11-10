@@ -804,6 +804,161 @@ static int phaseReplay(const char* path, int maxOps) {
     return 0;
 }
 
+// Opt-in HDMI tint bisect. Ordinary `replay` / OBS init are unchanged.
+// Stops after N attempted ops from a cold-init seq file, logs every failure with
+// IDs, and refuses to call a run "clean" when unexpected stalls happen.
+// Partial replay leaves the card mid-sequence: always USB unplug/replug between
+// trials. Not proven safe beyond that manual reset discipline.
+struct TintStop { const char* name; int after; const char* note; };
+static const TintStop kTintStops[] = {
+    { "host_setup",       9, "Opening host-setup ops that stall as vendor requests." },
+    { "wake",            15, "Through 0xC2 wake and gpio read back." },
+    { "before_hdmi_tx", 704, "Just before the first IT66121 (0x5098) writes." },
+    { "hdmi_tx1",       707, "After the first three HDMI transmitter writes." },
+    { "before_matrix",  978, "Just before the first p0 0x93..0xAA colour-matrix writes." },
+    { "dense_matrix",  1025, "After the first dense YCbCr-style matrix block." },
+    { "cold_matrix",   1457, "After later cold-style matrix values settle." },
+    { "full",          9966, "Entire cold-init replay (OBS --init init half)." },
+};
+static const int kTintStopCount = sizeof kTintStops / sizeof kTintStops[0];
+
+static int tintResolveStop(const char* tok) {
+    if (!tok || !*tok) return -1;
+    bool digits = true;
+    for (const char* p = tok; *p; p++) if (*p < '0' || *p > '9') { digits = false; break; }
+    if (digits) {
+        int n = atoi(tok);
+        return n >= 1 ? n : -1;
+    }
+    for (int i = 0; i < kTintStopCount; i++)
+        if (!strcmp(tok, kTintStops[i].name)) return kTintStops[i].after;
+    return -1;
+}
+
+static void tintPrintStops() {
+    printf("recommended stops (inclusive attempted-op index):\n");
+    for (int i = 0; i < kTintStopCount; i++)
+        printf("  %-14s %5d  %s\n", kTintStops[i].name, kTintStops[i].after, kTintStops[i].note);
+}
+
+static void tintPrintProtocol(int stopAfter) {
+    printf("\n== tint-bisect protocol ==\n");
+    printf("Partial replay is NOT inherently safe. Between every trial:\n");
+    printf("  1. Quit OBS / anything holding the card.\n");
+    printf("  2. Unplug the HD60 S USB cable, wait 2s, plug it back in.\n");
+    printf("  3. Confirm the TV baseline: normal / green / no-signal.\n");
+    printf("  4. Only then run tint-bisect again.\n");
+    printf("After this run the card is mid-init until you replug.\n");
+    printf("Stopping after attempted op %d.\n", stopAfter);
+    printf("Score the TV as exactly one of: normal | green | no-signal\n");
+    printf("A green result at N means the tint cause is at or before op N.\n");
+    printf("normal at N and green at a later M brackets the cause (N, M].\n");
+    printf("no-signal means the cut was too harsh or the link dropped; replug.\n");
+    printf("This tool does not change colour-matrix values on purpose.\n");
+}
+
+static const char* tintTag(unsigned br, unsigned wv, const uint8_t* buf, int len) {
+    if (br == 0xc2) return " [wake/reset]";
+    if (wv == 0x5098) return " [hdmi-tx]";
+    if (wv == 0x509c && len >= 1 && buf[0] >= 0x93 && buf[0] <= 0xaa) return " [colour-matrix]";
+    if (wv == 0x509c && len >= 1 && buf[0] == 0x00) return " [video-page]";
+    if (wv == 0x5066) return " [mcu]";
+    return "";
+}
+
+// Expected opening stalls from the verbose reporter log: ops 1..9 STALL only.
+static bool tintExpectedFail(int n, unsigned br, IOReturn r) {
+    if (r == kIOReturnSuccess) return false;
+    if (n < 1 || n > 9) return false;
+    if (r != kIOUSBPipeStalled) return false;
+    return br == 0x01 || br == 0x03 || br == 0x09 || br == 0x30;
+}
+
+static int phaseTintBisect(const char* path, int stopAfter) {
+    FILE* f = fopen(path, "r");
+    if (!f) { printf("  cannot open %s\n", path); return 2; }
+    tintPrintProtocol(stopAfter);
+    printf("\n-- tint-bisect replaying %s, stop after %d --\n", path, stopAfter);
+    char line[4096];
+    int n = 0, out = 0, in = 0, skipped = 0;
+    int failed = 0, unexpected = 0, expectedStall = 0;
+    int milestonesHit = 0;
+    static const unsigned mileWV[] = { 0x5098, 0x509c };
+    (void)mileWV;
+    while (fgets(line, sizeof line, f) && n < stopAfter) {
+        char dir[8], breq[16], wv[16], wi[16];
+        int len = 0;
+        if (sscanf(line, "%7[^|]|%15[^|]|%15[^|]|%15[^|]|%d|", dir, breq, wv, wi, &len) != 5)
+            continue;
+        if (!strcmp(dir, "RET")) continue;
+        unsigned br = (unsigned)strtol(breq, nullptr, 16);
+        unsigned v  = (unsigned)strtol(wv,   nullptr, 16);
+        unsigned ix = (unsigned)strtol(wi,   nullptr, 16);
+        if (br == 0x06 || br == 0x00 || br == 0x0b || br == 0x31) { skipped++; continue; }
+        uint8_t buf[72]; memset(buf, 0, sizeof buf);
+        if (len > (int)sizeof buf) len = sizeof buf;
+        bool isIn = !strcmp(dir, "IN");
+        if (!isIn && len > 0) {
+            const char* d = line;
+            for (int k = 0; k < 5 && d; k++) d = strchr(d + 1, '|');
+            if (d) { d++;
+                for (int k = 0; k < len; k++) {
+                    while (*d == ' ') d++;
+                    if (!*d || *d == '\n') break;
+                    buf[k] = (uint8_t)strtol(d, (char**)&d, 16);
+                } }
+        }
+        IOReturn r = ctl((uint8_t)br, (uint16_t)v, (uint16_t)ix,
+                         len ? buf : nullptr, (uint16_t)len, isIn, 120);
+        isIn ? in++ : out++;
+        n++;
+        const char* tag = tintTag(br, v, buf, len);
+        if (r != kIOReturnSuccess) {
+            failed++;
+            bool exp = tintExpectedFail(n, br, r);
+            if (exp) expectedStall++;
+            else unexpected++;
+            printf("  FAIL op %d %s bReq=0x%02x wV=0x%04x wI=0x%04x len=%d -> 0x%08x %s%s%s\n",
+                   n, isIn ? "IN " : "OUT", br, v, ix, len, r, ioerr(r), tag,
+                   exp ? " (expected opening stall)" : " (UNEXPECTED)");
+        } else if (br == 0xc2 || v == 0x5098 ||
+                   (v == 0x509c && len >= 1 && buf[0] >= 0x93 && buf[0] <= 0xaa)) {
+            printf("  ok   op %d %s bReq=0x%02x wV=0x%04x wI=0x%04x len=%d%s\n",
+                   n, isIn ? "IN " : "OUT", br, v, ix, len, tag);
+            milestonesHit++;
+        }
+        for (int i = 0; i < kTintStopCount; i++) {
+            if (kTintStops[i].after == n)
+                printf("  >> checkpoint %-14s reached (%s)\n",
+                       kTintStops[i].name, kTintStops[i].note);
+        }
+        if (n % 500 == 0)
+            printf("  progress %d / %d (%d failed, %d unexpected)\n",
+                   n, stopAfter, failed, unexpected);
+    }
+    fclose(f);
+    printf("\n-- tint-bisect summary --\n");
+    printf("  attempted: %d  OUT: %d  IN: %d  standard skipped: %d\n", n, out, in, skipped);
+    printf("  failed: %d  expected opening stalls: %d  unexpected: %d\n",
+           failed, expectedStall, unexpected);
+    printf("  milestone ok lines printed: %d\n", milestonesHit);
+    if (n < stopAfter)
+        printf("  WARNING: file ended at op %d before stop-after %d\n", n, stopAfter);
+    printf("  TV check now: normal | green | no-signal\n");
+    printf("  Then USB unplug/replug before any other command or OBS.\n");
+    if (unexpected) {
+        printf("  RESULT: incomplete (unexpected USB failures). Do not trust this bracket.\n");
+        return 3;
+    }
+    if (n < stopAfter) {
+        printf("  RESULT: incomplete (short file).\n");
+        return 2;
+    }
+    printf("  RESULT: ran to stop-after with only expected opening stalls (if any).\n");
+    printf("  Not a colour fix. Bracket only.\n");
+    return 0;
+}
+
 // Interface 1 has an interrupt IN endpoint (0x81, 64 bytes) that nothing here
 // has ever touched. 48 kHz stereo 16-bit is 192 KB/s, which fits, so this is
 // the first place to look for the audio path.
@@ -1120,6 +1275,9 @@ static void usage() {
 "  sinkedid              read the downstream display's EDID through the MCU\n"
 "                        I2C proxy, as the vendor does after init.\n"
 "  replay FILE [N]       replay a --seq capture verbatim, reads included.\n"
+"  tint-bisect           OPT-IN HDMI tint bracket. Requires --stop-after and\n"
+"                        --i-will-replug. Partial replay; USB replug between trials.\n"
+"                        Does not change ordinary replay/OBS init.\n"
 "  audio [secs]          read interface 1's interrupt endpoint, looking for the\n"
 "                        audio path.\n"
 "  vdiff                 read-only. Our register state against the vendor's\n"
@@ -1159,13 +1317,70 @@ static void usage() {
 "                        control requests.\n"
 "  --alt N               alternate setting to stream on (default 2).\n"
 "  --iter N              readiness poll iterations (default 1500, ~10 s).\n"
-"  -v                    log every control transfer.\n");
+"  -v                    log every control transfer.\n"
+"\n"
+"tint-bisect options:\n"
+"  --stop-after N|NAME   required unless --list-stops / --plan-only with name.\n"
+"  --i-will-replug       required for a live run (acknowledges USB replug protocol).\n"
+"  --file PATH           seq file (default data/cold-init-replay.txt).\n"
+"  --list-stops          print recommended stop names; no USB.\n"
+"  --plan-only           print the plan for --stop-after; no USB.\n");
 }
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) { usage(); return 1; }
     const char* cmd = argv[1];
+
+    // tint-bisect is opt-in and validates args before any USB open.
+    if (!strcmp(cmd, "tint-bisect")) {
+        const char* stopTok = nullptr;
+        const char* file = "data/cold-init-replay.txt";
+        bool replug = false, listStops = false, planOnly = false;
+        for (int i = 2; i < argc; i++) {
+            if (!strcmp(argv[i], "--i-will-replug")) replug = true;
+            else if (!strcmp(argv[i], "--list-stops")) listStops = true;
+            else if (!strcmp(argv[i], "--plan-only")) planOnly = true;
+            else if (!strcmp(argv[i], "--stop-after") && i + 1 < argc) stopTok = argv[++i];
+            else if (!strcmp(argv[i], "--file") && i + 1 < argc) file = argv[++i];
+            else if (!strcmp(argv[i], "-v")) gVerbose = 1;
+            else { printf("  tint-bisect: unknown argument %s\n", argv[i]); usage(); return 1; }
+        }
+        if (listStops) { tintPrintStops(); return 0; }
+        if (!stopTok) {
+            printf("  tint-bisect needs --stop-after N|NAME (or --list-stops).\n");
+            tintPrintStops();
+            return 1;
+        }
+        int stopAfter = tintResolveStop(stopTok);
+        if (stopAfter < 1) {
+            printf("  bad --stop-after %s\n", stopTok);
+            tintPrintStops();
+            return 1;
+        }
+        if (planOnly) {
+            printf("tint-bisect plan for stop-after %d (%s)\n", stopAfter, stopTok);
+            printf("file: %s\n", file);
+            tintPrintProtocol(stopAfter);
+            for (int i = 0; i < kTintStopCount; i++) {
+                const char* mark = kTintStops[i].after <= stopAfter ? "*" : " ";
+                printf("  [%s] %-14s %5d  %s\n", mark, kTintStops[i].name,
+                       kTintStops[i].after, kTintStops[i].note);
+            }
+            printf("offline map: python3 tools/tint_bisect_map.py --stop-after %s\n", stopTok);
+            return 0;
+        }
+        if (!replug) {
+            printf("  Refusing to run: pass --i-will-replug after reading the protocol.\n");
+            tintPrintProtocol(stopAfter);
+            return 1;
+        }
+        if (!openDevice()) return 1;
+        int trc = phaseTintBisect(file, stopAfter);
+        if (gIf) (*gIf)->USBInterfaceClose(gIf);
+        (*gDev)->USBDeviceClose(gDev);
+        return trc;
+    }
 
     bool prologue = false, maintain = false, verify = false;
     bool force = false, doFormat = false; int alt = 2, iter = 1500, secs = 5;

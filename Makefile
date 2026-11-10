@@ -43,7 +43,11 @@ obs-plugin:
 	codesign --force --sign - "$(PLUGIN)"
 	@echo "installed to $(PLUGIN)"
 
+# Hardware-free checks for the tint-bisect stop map / seq parsing.
+test-tint-bisect:
+	cd tools && python3 test_tint_bisect_map.py
+
 clean:
 	rm -f $(DRIVER) demux
 
-.PHONY: all clean obs-plugin
+.PHONY: all clean obs-plugin test-tint-bisect
