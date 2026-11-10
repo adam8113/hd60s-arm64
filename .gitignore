@@ -11,3 +11,4 @@ demux
 build/
 obs-studio/
 .DS_Store
+__pycache__/
