@@ -647,6 +647,81 @@ static int phaseFormat(bool force) {
     return 0;
 }
 
+// Colour space conversion in the video front end, set from the source.
+//
+// The HDMI transmitter behind the passthrough port (IT66121, I2C 0x9A) is set
+// up by the cold init to take YCbCr 4:2:2 from the front end and convert it to
+// RGB for the display. The capture path takes the same YCbCr. The cold init
+// leaves the front end matrix at identity, which is right for a YCbCr source and
+// wrong for an RGB one: R, G and B go out as Cr, Y and Cb, so grey turns green
+// and white turns pink, on the TV and in OBS alike. A Switch always sends RGB,
+// and so does a PS5 at 1080p SDR.
+//
+// Page 2 0x48..0x4b hold the received AVI InfoFrame, PB1..PB4. 0x48 bit 7 is set
+// whenever a frame has been received (0x80, 0x82, 0xd2 seen; 0x00 with no
+// signal), and bits 6:5 are the colour space: 0 RGB, 1 YCbCr 4:2:2, 2 4:4:4.
+//
+// For RGB the vendor driver writes p0 0x92 = 0x40 and a BT.709 RGB to YCbCr
+// limited matrix into 0x93..0xAA. Each coefficient is a 16-bit pair, high byte
+// first, 1.0 = 0x1000, negative values in two's complement over 15 bits. The
+// nine are laid out by input R, G, B, each giving Cr, Y, Cb.
+// The cold init's own values are restored for a YCbCr source.
+static const uint8_t kCscRgb[] = {
+    0x07,0x06, 0x02,0xf7, 0x7e,0x65,   // R -> Cr  0.439, Y  0.185, Cb -0.100
+    0x79,0xa0, 0x09,0xfc, 0x7a,0x96,   // G -> Cr -0.398, Y  0.624, Cb -0.338
+    0x7f,0x5b, 0x01,0x02, 0x07,0x06,   // B -> Cr -0.040, Y  0.063, Cb  0.439
+    0x20,0x00, 0x00,0x00, 0x20,0x00,   // offsets
+};
+static const uint8_t kCscYcbcr[] = {
+    0x0d,0xc0, 0x00,0x00, 0x00,0x00,
+    0x00,0x00, 0x0d,0xf6, 0x00,0x00,
+    0x00,0x00, 0x00,0x00, 0x0d,0xc0,
+    0x20,0x00, 0x00,0x00, 0x20,0x00,
+};
+static const uint8_t kCscModeRgb = 0x40, kCscModeYcbcr = 0x62;
+
+static int sourceColourSpace() {
+    // The InfoFrame can be read mid-update; take two matching reads.
+    for (int attempt = 0; attempt < 10; attempt++) {
+        int a = vidRead(2, 0x48);
+        usleep(20000);
+        int b = vidRead(2, 0x48);
+        if (a >= 0 && a == b && (a & 0x80)) return (a >> 5) & 3;
+        usleep(100000);
+    }
+    return -1;
+}
+
+// mode: 0 auto, 1 force RGB, 2 force YCbCr
+static int phaseColour(int mode) {
+    printf("\n-- colour space conversion --\n");
+    int cs = sourceColourSpace();
+    static const char* names[] = { "RGB", "YCbCr 4:2:2", "YCbCr 4:4:4", "reserved" };
+    if (cs >= 0) printf("  source InfoFrame: %s (p2 48 = %02x)\n", names[cs], vidRead(2, 0x48));
+    else         printf("  no AVI InfoFrame from the source (no signal yet?)\n");
+    bool rgb;
+    if (mode == 1)      rgb = true;
+    else if (mode == 2) rgb = false;
+    else if (cs < 0) {
+        printf("  leaving the conversion as it is. Run ./start colour once the source is on.\n");
+        return 1;
+    } else rgb = (cs == 0);
+
+    int ab = vidRead(0, 0xab);
+    if (ab < 0) { printf("  front end not answering, run the cold init first\n"); return 2; }
+    vidWrite(0, 0xab, (uint8_t)(ab | 0x80));            // hold
+    vidWrite(0, 0x92, rgb ? kCscModeRgb : kCscModeYcbcr);
+    const uint8_t* m = rgb ? kCscRgb : kCscYcbcr;
+    for (int i = 0; i < 24; i++) vidWrite(0, (uint8_t)(0x93 + i), m[i]);
+    vidWrite(0, 0xab, (uint8_t)(ab & 0x7f));            // release
+
+    int bad = (vidRead(0, 0x92) != (rgb ? kCscModeRgb : kCscModeYcbcr));
+    for (int i = 0; i < 24; i++) if (vidRead(0, (uint8_t)(0x93 + i)) != m[i]) bad++;
+    printf("  set for %s input%s\n", rgb ? "RGB" : "YCbCr", bad ? "" : ", read back ok");
+    if (bad) printf("  %d registers did not hold\n", bad);
+    return bad ? 3 : 0;
+}
+
 // Read-only. Compare our register state against the state the vendor driver's
 // card was actually in, taken from every read in the good capture. Anything
 // that differs is a candidate for the colour fault.
@@ -1120,6 +1195,8 @@ static void usage() {
 "  sinkedid              read the downstream display's EDID through the MCU\n"
 "                        I2C proxy, as the vendor does after init.\n"
 "  replay FILE [N]       replay a --seq capture verbatim, reads included.\n"
+"  colour [rgb|ycbcr]    set the front end colour conversion from the source's\n"
+"                        AVI InfoFrame, or force it. Run after the cold init.\n"
 "  audio [secs]          read interface 1's interrupt endpoint, looking for the\n"
 "                        audio path.\n"
 "  vdiff                 read-only. Our register state against the vendor's\n"
@@ -1225,6 +1302,19 @@ int main(int argc, char** argv) {
         else rc = phaseSinkEdid();
     } else if (!strcmp(cmd, "replay") && argc >= 3) {
         rc = phaseReplay(argv[2], argc >= 4 ? atoi(argv[3]) : 0);
+    } else if (!strcmp(cmd, "txdump")) {
+        // read-only: HDMI transmitter (IT66121, I2C 0x9A) bank 0 registers
+        for (int r = 0; r < 256; r++) {
+            int v = mcuRead((uint8_t)r);
+            if ((r & 15) == 0) printf("  %02x:", r);
+            printf(" %02x", v < 0 ? 0xee : v);
+            if ((r & 15) == 15) printf("\n");
+        }
+    } else if (!strcmp(cmd, "colour") || !strcmp(cmd, "color")) {
+        int mode = 0;
+        if (argc >= 3 && !strcmp(argv[2], "rgb"))   mode = 1;
+        if (argc >= 3 && !strcmp(argv[2], "ycbcr")) mode = 2;
+        rc = phaseColour(mode);
     } else if (!strcmp(cmd, "audio")) {
         rc = phaseAudio(secs);
     } else if (!strcmp(cmd, "vdiff")) {

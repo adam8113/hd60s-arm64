@@ -45,6 +45,10 @@ trap cleanup EXIT INT TERM
 
 if [ -n "$INIT" ]; then
     ./start replay data/cold-init-replay.txt
+    # RGB sources (Switch, PS5) need the front end's RGB to YCbCr conversion,
+    # or the passthrough and the capture both go green. Not fatal if the source
+    # is not sending yet.
+    ./start colour || true
 fi
 
 D="${TMPDIR:-/tmp}/hd60s.$$"
