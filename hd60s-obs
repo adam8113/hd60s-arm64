@@ -12,12 +12,10 @@
 # With --udp it goes through ffmpeg to udp://127.0.0.1:9600 instead, for an OBS
 # media source. That path needs no plugin but costs an encode and some latency.
 #
-# --init runs the cold-init replay (needed for the isoc capture path) then
-# programmes front-end colour from the AVI InfoFrame. Without --init, configure
-# by hand:
+# --init runs ./start bringup (cold-init replay + colour). Without --init,
+# configure by hand:
 #
-#     ./start replay data/cold-init-replay.txt
-#     ./start colour
+#     ./start bringup
 #     # picture-only (no capture): ./start up
 #     # wedged card: ./start restart
 set -e
@@ -47,14 +45,8 @@ cleanup() { kill -INT $ST 2>/dev/null; kill $FF $DX 2>/dev/null; rm -rf "$D" "$L
 trap cleanup EXIT INT TERM
 
 if [ -n "$INIT" ]; then
-    # Capture needs the cold init. Colour afterwards stops RGB sources going green.
-    ./start replay data/cold-init-replay.txt
-    if ! ./start colour; then
-        echo "hd60s-obs: colour failed; capture may be green. See docs/RGB_COLOUR.md" >&2
-        sleep 2
-        if ! ./start colour; then
-            echo "hd60s-obs: colour still not applied" >&2
-        fi
+    if ! ./start bringup; then
+        echo "hd60s-obs: bringup failed; try ./start colour once the source is on" >&2
     fi
 fi
 

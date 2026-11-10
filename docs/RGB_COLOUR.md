@@ -31,8 +31,7 @@ also checked capture.
 
 **Capture / OBS:**
 
-    ./start replay data/cold-init-replay.txt
-    ./start colour
+    ./start bringup    # replay + colour (same as hd60s-obs --init)
 
 Op 35 of the cold init writes IT66121 `0x04 = 0x3d` (TX reset). The TV goes
 "No signal" mid-replay; finishing the replay + colour brings capture up, and

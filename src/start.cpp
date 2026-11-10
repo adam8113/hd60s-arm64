@@ -204,9 +204,14 @@ static bool openDevice(bool quiet = false) {
     }
     IOReturn o = (*gDev)->USBDeviceOpen(gDev);
     if (o != kIOReturnSuccess) {
-        if (!quiet) printf("  USBDeviceOpen failed 0x%08x %s\n", o, ioerr(o));
-        (*gDev)->Release(gDev); gDev = nullptr;
-        return false;
+        // Another process may hold a non-exclusive open (browser USB probes).
+        o = (*gDev)->USBDeviceOpenSeize(gDev);
+        if (o != kIOReturnSuccess) {
+            if (!quiet) printf("  USBDeviceOpen failed 0x%08x %s\n", o, ioerr(o));
+            (*gDev)->Release(gDev); gDev = nullptr;
+            return false;
+        }
+        if (!quiet) printf("  USBDeviceOpenSeize ok (device was busy)\n");
     }
     UInt8 c = 0; (*gDev)->GetConfiguration(gDev, &c);
     if (c != 1) {
@@ -228,7 +233,50 @@ static bool openDevice(bool quiet = false) {
     return true;
 }
 
+// True if CreateInterfaceIterator can see interface 0 (does not open it).
+static bool iface0Visible() {
+    if (!gDev) return false;
+    IOUSBFindInterfaceRequest rq = { kIOUSBFindInterfaceDontCare, kIOUSBFindInterfaceDontCare,
+                                     kIOUSBFindInterfaceDontCare, kIOUSBFindInterfaceDontCare };
+    io_iterator_t ii; (*gDev)->CreateInterfaceIterator(gDev, &rq, &ii);
+    bool found = false;
+    io_service_t is;
+    while ((is = IOIteratorNext(ii))) {
+        IOCFPlugInInterface** pl = nullptr; SInt32 sc;
+        IOUSBInterfaceInterface500** f = nullptr;
+        if (IOCreatePlugInInterfaceForService(is, kIOUSBInterfaceUserClientTypeID,
+                kIOCFPlugInInterfaceID, &pl, &sc) == KERN_SUCCESS && pl) {
+            (*pl)->QueryInterface(pl, CFUUIDGetUUIDBytes(kIOUSBInterfaceInterfaceID500),
+                                  (LPVOID*)&f);
+            (*pl)->Release(pl);
+        }
+        IOObjectRelease(is);
+        if (!f) continue;
+        UInt8 n = 0; (*f)->GetInterfaceNumber(f, &n);
+        (*f)->Release(f);
+        if (n == 0) { found = true; break; }
+    }
+    IOObjectRelease(ii);
+    return found;
+}
+
+// After soft re-enumerate the device node can appear before its interfaces.
+static bool waitForIface0(int waitMs = 5000) {
+    const int step = 200;
+    for (int t = 0; t < waitMs; t += step) {
+        if (iface0Visible()) return true;
+        usleep((useconds_t)step * 1000);
+    }
+    return iface0Visible();
+}
+
 static bool claimInterface0() {
+    if (gIf) return true;
+    if (!waitForIface0(5000)) {
+        printf("  interface 0 not found (waited 5s after config). "
+               "Unplug/replug USB if a soft reset just ran.\n");
+        return false;
+    }
     IOUSBFindInterfaceRequest rq = { kIOUSBFindInterfaceDontCare, kIOUSBFindInterfaceDontCare,
                                      kIOUSBFindInterfaceDontCare, kIOUSBFindInterfaceDontCare };
     io_iterator_t ii; (*gDev)->CreateInterfaceIterator(gDev, &rq, &ii);
@@ -251,7 +299,11 @@ static bool claimInterface0() {
     IOObjectRelease(ii);
     if (!gIf) { printf("  interface 0 not found\n"); return false; }
     IOReturn r = (*gIf)->USBInterfaceOpen(gIf);
-    if (r != kIOReturnSuccess) { printf("  USBInterfaceOpen failed 0x%08x\n", r); return false; }
+    if (r != kIOReturnSuccess) {
+        printf("  USBInterfaceOpen failed 0x%08x %s\n", r, ioerr(r));
+        (*gIf)->Release(gIf); gIf = nullptr;
+        return false;
+    }
     UInt8 curAlt = 0xff; (*gIf)->GetAlternateSetting(gIf, &curAlt);
     UInt8 nEp = 0; (*gIf)->GetNumEndpoints(gIf, &nEp);
     printf("  interface 0 open, current alt %u, %u endpoint(s)\n", curAlt, nEp);
@@ -848,6 +900,8 @@ static int phaseReset(int waitMs = 12000) {
             printf("  card back after %.1fs, MCU answering\n",
                    (i * stepMs + 300) / 1000.0);
             printLinkSpeed();
+            if (!waitForIface0(5000))
+                printf("  warning: interface 0 not published yet; capture may need a USB replug\n");
             return 0;
         }
         if (aw == -2) {
@@ -901,6 +955,24 @@ static int phaseRestart() {
         return rc;
     }
     return phaseUp();
+}
+
+// Capture bring-up in one shot: cold-init replay + colour.
+static int phaseBringup(const char* replayPath) {
+    printf("\n-- bringup: replay + colour --\n");
+    int rc = phaseReplay(replayPath, 0);
+    if (rc != 0) return rc;
+    rc = phaseColour(0, 8000);
+    if (rc == 1) {
+        printf("  no InfoFrame yet; retrying colour in 2s\n");
+        usleep(2000000);
+        rc = phaseColour(0, 5000);
+        if (rc == 1) {
+            printf("  colour deferred; run ./start colour once the source is on\n");
+            return 0;
+        }
+    }
+    return rc;
 }
 
 // Read-only. Compare our register state against the state the vendor driver's
@@ -1400,6 +1472,8 @@ static void usage() {
 "  restart               reset + up. Soft recovery without a cable yank.\n"
 "  replay FILE [N]       verbatim cold-init capture. Needed for capture. Clears\n"
 "                        TX 0x20 afterwards (left at 0x01 the TV stays black).\n"
+"  bringup [FILE]        replay + colour. Default FILE is data/cold-init-replay.txt.\n"
+"                        What hd60s-obs --init runs.\n"
 "  audio [secs]          read interface 1's interrupt endpoint, looking for the\n"
 "                        audio path.\n"
 "  vdiff                 read-only. Our register state against the vendor's\n"
@@ -1524,6 +1598,10 @@ int main(int argc, char** argv) {
         rc = phaseUp();
     } else if (!strcmp(cmd, "restart")) {
         rc = phaseRestart();
+    } else if (!strcmp(cmd, "bringup")) {
+        const char* path = (argc >= 3 && argv[2][0] != '-') ? argv[2]
+                                                           : "data/cold-init-replay.txt";
+        rc = phaseBringup(path);
     } else if (!strcmp(cmd, "audio")) {
         rc = phaseAudio(secs);
     } else if (!strcmp(cmd, "vdiff")) {
