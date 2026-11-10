@@ -35,18 +35,28 @@ Restart OBS and add the source "Elgato HD60 S". The source
 starts the capture itself, cold init included, and stops it again when you
 remove the source. It takes about seven seconds to show a picture. If the picture stays black, read `/tmp/hd60s-capture.log`.
 
-If the picture is green where it should be dark grey and pink where it should
-be white, your source is sending RGB rather than YCbCr. A Nintendo Switch always
-does. Open the source's properties and set "Input colour" to RGB. Fitted from
-one Switch capture — close, not exact.
+The card must be on a **USB 3 SuperSpeed** link. On USB 2.0, control transfers
+still work (passthrough / colour) but isochronous capture does not.
 
-To drive it by hand, untick "Start the capture with this source" and run:
+RGB sources (Switch, PS5 at 1080p SDR) are converted to YCbCr in hardware during
+init. Leave the OBS source's **Input colour** on **YCbCr**. The RGB option is a
+legacy software workaround for cards that were inited without that conversion;
+using both corrects twice and looks wrong. Details: `docs/RGB_COLOUR.md`.
+
+Picture only (no capture):
+
+    ./start up         # wake + colour
+    ./start restart    # USB re-enumerate + up, if the card is wedged
+
+Capture / OBS needs the cold-init replay first (wake+colour alone leaves the
+isoc pipe empty):
 
     ./start replay data/cold-init-replay.txt
+    ./start colour
     ./hd60s-obs
 
 `hd60s-obs --udp` skips the plugin and sends mpegts to udp://127.0.0.1:9600 for
-an OBS media source instead.
+an OBS media source instead. `hd60s-obs --init` runs replay then colour.
 
 ## How it works
 

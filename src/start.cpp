@@ -47,6 +47,8 @@ static bool gNoP80 = false;
 // black out the HDMI passthrough, so they are opt-in.
 static bool gArm = false, gPost = false;
 
+static int phaseReplay(const char* path, int maxOps);
+
 // ---------------------------------------------------------------- transport
 
 static const char* ioerr(IOReturn r) {
@@ -57,6 +59,9 @@ static const char* ioerr(IOReturn r) {
         case kIOReturnNotResponding:    return "not responding";
         case kIOReturnNoDevice:         return "no device";
         case kIOReturnNotOpen:          return "not open";
+        case kIOReturnNotPrivileged:    return "not privileged";
+        case kIOReturnNoResources:      return "no resources (sandbox?)";
+        case kIOReturnExclusiveAccess:  return "exclusive access";
         default:                        return "?";
     }
 }
@@ -135,14 +140,42 @@ static int gpioRead(uint16_t sel) {
 
 // ---------------------------------------------------------------- discovery
 
-static bool openDevice() {
+static void releaseDevice() {
+    if (gIf) {
+        (*gIf)->USBInterfaceClose(gIf);
+        (*gIf)->Release(gIf);
+        gIf = nullptr;
+    }
+    if (gDev) {
+        (*gDev)->USBDeviceClose(gDev);
+        (*gDev)->Release(gDev);
+        gDev = nullptr;
+    }
+}
+
+static bool openDevice(bool quiet = false) {
+    if (gDev) releaseDevice();
     io_iterator_t it; io_service_t s;
     IOServiceGetMatchingServices(kIOMainPortDefault,
                                  IOServiceMatching(kIOUSBDeviceClassName), &it);
+    int seen = 0, pluginFail = 0;
+    IOReturn lastPlugin = kIOReturnSuccess;
     while ((s = IOIteratorNext(it))) {
+        io_name_t nm; IORegistryEntryGetName(s, nm);
+        CFNumberRef vidN = (CFNumberRef)IORegistryEntryCreateCFProperty(
+            s, CFSTR(kUSBVendorID), kCFAllocatorDefault, 0);
+        CFNumberRef pidN = (CFNumberRef)IORegistryEntryCreateCFProperty(
+            s, CFSTR(kUSBProductID), kCFAllocatorDefault, 0);
+        int vv = 0, pp = 0;
+        if (vidN) { CFNumberGetValue(vidN, kCFNumberIntType, &vv); CFRelease(vidN); }
+        if (pidN) { CFNumberGetValue(pidN, kCFNumberIntType, &pp); CFRelease(pidN); }
+        bool ours = isHD60S((UInt16)vv, (UInt16)pp) ||
+                    strstr(nm, "HD60") != nullptr || strstr(nm, "Game Capture") != nullptr;
+        if (ours) seen++;
         IOCFPlugInInterface** pl = nullptr; SInt32 sc;
-        if (IOCreatePlugInInterfaceForService(s, kIOUSBDeviceUserClientTypeID,
-                kIOCFPlugInInterfaceID, &pl, &sc) == KERN_SUCCESS && pl) {
+        kern_return_t kr = IOCreatePlugInInterfaceForService(s, kIOUSBDeviceUserClientTypeID,
+                kIOCFPlugInInterfaceID, &pl, &sc);
+        if (kr == KERN_SUCCESS && pl) {
             IOUSBDeviceInterface500** d = nullptr;
             (*pl)->QueryInterface(pl, CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID500),
                                   (LPVOID*)&d);
@@ -151,16 +184,34 @@ static bool openDevice() {
                 (*d)->GetDeviceVendor(d, &v); (*d)->GetDeviceProduct(d, &p);
                 if (isHD60S(v, p)) { gDev = d; IOObjectRelease(s); break; }
                 (*d)->Release(d); }
+        } else if (ours) {
+            pluginFail++;
+            lastPlugin = (IOReturn)kr;
         }
         IOObjectRelease(s);
     }
     IOObjectRelease(it);
-    if (!gDev) { printf("  HD60 S not found. Plug it in and try again.\n"); return false; }
-    (*gDev)->USBDeviceOpen(gDev);
+    if (!gDev) {
+        if (!quiet) {
+            if (seen && pluginFail)
+                printf("  HD60 S is present but the USB user client will not open "
+                       "(0x%08x %s). Run outside a sandbox, or check exclusivity.\n",
+                       lastPlugin, ioerr(lastPlugin));
+            else
+                printf("  HD60 S not found. Plug it in and try again.\n");
+        }
+        return false;
+    }
+    IOReturn o = (*gDev)->USBDeviceOpen(gDev);
+    if (o != kIOReturnSuccess) {
+        if (!quiet) printf("  USBDeviceOpen failed 0x%08x %s\n", o, ioerr(o));
+        (*gDev)->Release(gDev); gDev = nullptr;
+        return false;
+    }
     UInt8 c = 0; (*gDev)->GetConfiguration(gDev, &c);
     if (c != 1) {
         IOReturn sc = (*gDev)->SetConfiguration(gDev, 1);
-        printf("  SetConfiguration(1) -> 0x%08x%s\n", sc,
+        if (!quiet) printf("  SetConfiguration(1) -> 0x%08x%s\n", sc,
                sc == kIOReturnSuccess ? "" : "  FAILED");
         (*gDev)->GetConfiguration(gDev, &c);
     }
@@ -168,10 +219,12 @@ static bool openDevice() {
     UInt8 nc = 0; (*gDev)->GetNumberOfConfigurations(gDev, &nc);
     // IOKit: 0 low, 1 full, 2 high, 3 super, 4 super+
     static const char* sn[] = { "low", "full", "high (USB 2.0 link)", "SuperSpeed", "SuperSpeed+" };
-    printf("  device open, config %u (of %u), speed %s\n", c, nc,
-           speed < 5 ? sn[speed] : "?");
-    if (speed < 3)
-        printf("  WARNING: not a SuperSpeed link. Alt 2 does not exist at USB 2.0.\n");
+    if (!quiet) {
+        printf("  device open, config %u (of %u), speed %s\n", c, nc,
+               speed < 5 ? sn[speed] : "?");
+        if (speed < 3)
+            printf("  WARNING: not a SuperSpeed link. Alt 2 does not exist at USB 2.0.\n");
+    }
     return true;
 }
 
@@ -552,23 +605,48 @@ static const RefReg kMeasureRef[] = {
 };
 static const int kMeasureRefLen = sizeof kMeasureRef / sizeof kMeasureRef[0];
 
+// Front-end colour conversion. Canonical values for p0 0x92 and 0x93..0xAA.
+// Shared by ./start colour and ./start format so the two paths cannot drift.
+// Coefficients are BT.709 full-range RGB to limited YCbCr; each input R/G/B
+// produces Cr, Y, Cb as 16-bit pairs (high byte first, 1.0 = 0x1000).
+static const uint8_t kCscRgb[] = {
+    0x07,0x06, 0x02,0xf7, 0x7e,0x65,   // R -> Cr  0.439, Y  0.185, Cb -0.100
+    0x79,0xa0, 0x09,0xfc, 0x7a,0x96,   // G -> Cr -0.398, Y  0.624, Cb -0.338
+    0x7f,0x5b, 0x01,0x02, 0x07,0x06,   // B -> Cr -0.040, Y  0.063, Cb  0.439
+    0x20,0x00, 0x00,0x00, 0x20,0x00,   // offsets
+};
+static const uint8_t kCscYcbcr[] = {
+    0x0d,0xc0, 0x00,0x00, 0x00,0x00,
+    0x00,0x00, 0x0d,0xf6, 0x00,0x00,
+    0x00,0x00, 0x00,0x00, 0x0d,0xc0,
+    0x20,0x00, 0x00,0x00, 0x20,0x00,
+};
+static const uint8_t kCscModeRgb = 0x40, kCscModeYcbcr = 0x62;
+
 // Written in this order, between an 0xAB bit-7 hold and release.
+// Matrix bytes at 0x92 / 0x93..0xAA come from kCscRgb (placeholder 0 below).
 static const RefReg kTiming[] = {
-    { 0, 0x90, 0x15 }, { 0, 0x91, 0x15 }, { 0, 0x92, 0x40 },
+    { 0, 0x90, 0x15 }, { 0, 0x91, 0x15 }, { 0, 0x92, 0x00 },
     { 0, 0xab, 0x95 }, { 0, 0xac, 0x95 }, { 0, 0xad, 0x05 },
     { 0, 0x1e, 0x11 }, { 0, 0x1f, 0x01 },
-    { 0, 0x9c, 0xfc }, { 0, 0x9b, 0x09 }, { 0, 0x96, 0xf7 }, { 0, 0x95, 0x02 },
-    { 0, 0xa2, 0x02 }, { 0, 0xa1, 0x01 }, { 0, 0x9a, 0xa0 }, { 0, 0x99, 0x79 },
-    { 0, 0x94, 0x06 }, { 0, 0x93, 0x07 },
-    { 0, 0xa0, 0x5b }, { 0, 0x9f, 0x7f }, { 0, 0x9e, 0x96 }, { 0, 0x9d, 0x7a },
-    { 0, 0x98, 0x65 }, { 0, 0x97, 0x7e },
-    { 0, 0xa4, 0x06 }, { 0, 0xa3, 0x07 },
-    { 0, 0xa6, 0x00 }, { 0, 0xa5, 0x20 },
+    { 0, 0x9c, 0x00 }, { 0, 0x9b, 0x00 }, { 0, 0x96, 0x00 }, { 0, 0x95, 0x00 },
+    { 0, 0xa2, 0x00 }, { 0, 0xa1, 0x00 }, { 0, 0x9a, 0x00 }, { 0, 0x99, 0x00 },
+    { 0, 0x94, 0x00 }, { 0, 0x93, 0x00 },
+    { 0, 0xa0, 0x00 }, { 0, 0x9f, 0x00 }, { 0, 0x9e, 0x00 }, { 0, 0x9d, 0x00 },
+    { 0, 0x98, 0x00 }, { 0, 0x97, 0x00 },
+    { 0, 0xa4, 0x00 }, { 0, 0xa3, 0x00 },
+    { 0, 0xa6, 0x00 }, { 0, 0xa5, 0x00 },
     { 0, 0xa8, 0x00 }, { 0, 0xa7, 0x00 },
-    { 0, 0xaa, 0x00 }, { 0, 0xa9, 0x20 },
+    { 0, 0xaa, 0x00 }, { 0, 0xa9, 0x00 },
     { 0, 0xb0, 0x21 },
 };
 static const int kTimingLen = sizeof kTiming / sizeof kTiming[0];
+
+static uint8_t timingVal(const RefReg& r) {
+    if (r.reg == 0x92) return kCscModeRgb;
+    if (r.reg >= 0x93 && r.reg <= 0xaa) return kCscRgb[r.reg - 0x93];
+    return r.val;
+}
 
 static int phaseMeasure() {
     printf("\n-- incoming signal measurement vs the known-good capture --\n");
@@ -620,30 +698,31 @@ static int phaseFormat(bool force) {
     int ab = vidRead(0, 0xab);
     if (ab < 0) { printf("  cannot read 0xab\n"); return -1; }
     vidWrite(0, 0xab, (uint8_t)(ab | 0x80));            // hold
+    int written = 0;
     for (int i = 0; i < kTimingLen; i++) {
-        // 0x93..0xAA pair up into twelve 16-bit values, which is the shape of a
-        // 3x3 colour matrix plus three offsets. The reference was captured from
-        // a YCbCr source; a computer output is usually RGB and wants a different
-        // matrix, so --nomatrix leaves the cold init's values in place.
+        // 0x92 / 0x93..0xAA are the RGB→YCbCr CSC (kCscRgb). --nomatrix leaves
+        // the cold init identity in place for a YCbCr source.
         uint8_t r = kTiming[i].reg;
-        if (gNoMatrix && r >= 0x93 && r <= 0xaa) continue;
-        vidWrite(kTiming[i].page, r, kTiming[i].val);
+        if (gNoMatrix && (r == 0x92 || (r >= 0x93 && r <= 0xaa))) continue;
+        vidWrite(kTiming[i].page, r, timingVal(kTiming[i]));
+        written++;
     }
-    if (gNoMatrix) printf("  (colour matrix 0x93..0xAA left at the cold init values)\n");
+    if (gNoMatrix) printf("  (colour matrix 0x92 / 0x93..0xAA left at the cold init values)\n");
     vidWrite(0, 0xab, (uint8_t)(ab & 0x7f));            // release
     printf("  %d timing registers written, 0xab pulsed 0x%02x -> 0x%02x\n",
-           kTimingLen, ab | 0x80, ab & 0x7f);
+           written, ab | 0x80, ab & 0x7f);
     int bad = 0;
     for (int i = 0; i < kTimingLen && !gNoMatrix; i++) {
+        uint8_t want = timingVal(kTiming[i]);
         int back = vidRead(kTiming[i].page, kTiming[i].reg);
-        if (back != kTiming[i].val) {
+        if (back != want) {
             if (bad < 12)
                 printf("    p%u %02x: wrote %02x, reads %02x\n",
-                       kTiming[i].page, kTiming[i].reg, kTiming[i].val, back);
+                       kTiming[i].page, kTiming[i].reg, want, back);
             bad++;
         }
     }
-    printf("  read-back: %d of %d timing registers did not hold\n", bad, kTimingLen);
+    printf("  read-back: %d of %d timing registers did not hold\n", bad, written);
     return 0;
 }
 
@@ -660,42 +739,35 @@ static int phaseFormat(bool force) {
 // Page 2 0x48..0x4b hold the received AVI InfoFrame, PB1..PB4. 0x48 bit 7 is set
 // whenever a frame has been received (0x80, 0x82, 0xd2 seen; 0x00 with no
 // signal), and bits 6:5 are the colour space: 0 RGB, 1 YCbCr 4:2:2, 2 4:4:4.
-//
-// For RGB the vendor driver writes p0 0x92 = 0x40 and a BT.709 RGB to YCbCr
-// limited matrix into 0x93..0xAA. Each coefficient is a 16-bit pair, high byte
-// first, 1.0 = 0x1000, negative values in two's complement over 15 bits. The
-// nine are laid out by input R, G, B, each giving Cr, Y, Cb.
-// The cold init's own values are restored for a YCbCr source.
-static const uint8_t kCscRgb[] = {
-    0x07,0x06, 0x02,0xf7, 0x7e,0x65,   // R -> Cr  0.439, Y  0.185, Cb -0.100
-    0x79,0xa0, 0x09,0xfc, 0x7a,0x96,   // G -> Cr -0.398, Y  0.624, Cb -0.338
-    0x7f,0x5b, 0x01,0x02, 0x07,0x06,   // B -> Cr -0.040, Y  0.063, Cb  0.439
-    0x20,0x00, 0x00,0x00, 0x20,0x00,   // offsets
-};
-static const uint8_t kCscYcbcr[] = {
-    0x0d,0xc0, 0x00,0x00, 0x00,0x00,
-    0x00,0x00, 0x0d,0xf6, 0x00,0x00,
-    0x00,0x00, 0x00,0x00, 0x0d,0xc0,
-    0x20,0x00, 0x00,0x00, 0x20,0x00,
-};
-static const uint8_t kCscModeRgb = 0x40, kCscModeYcbcr = 0x62;
+// Matrix bytes live in kCscRgb / kCscYcbcr above.
 
-static int sourceColourSpace() {
-    // The InfoFrame can be read mid-update; take two matching reads.
-    for (int attempt = 0; attempt < 10; attempt++) {
+// Wait up to waitMs for a stable AVI colour-space byte. Two matching reads with
+// bit 7 set count as locked; mid-update frames are ignored.
+static int sourceColourSpace(int waitMs = 1200) {
+    const int stepMs = 120;
+    int attempts = waitMs / stepMs;
+    if (attempts < 1) attempts = 1;
+    for (int attempt = 0; attempt < attempts; attempt++) {
         int a = vidRead(2, 0x48);
         usleep(20000);
         int b = vidRead(2, 0x48);
         if (a >= 0 && a == b && (a & 0x80)) return (a >> 5) & 3;
-        usleep(100000);
+        usleep((useconds_t)(stepMs - 20) * 1000);
     }
     return -1;
 }
 
 // mode: 0 auto, 1 force RGB, 2 force YCbCr
-static int phaseColour(int mode) {
+static int phaseColour(int mode, int waitMs = 8000) {
     printf("\n-- colour space conversion --\n");
-    int cs = sourceColourSpace();
+    int cs = -1;
+    if (mode == 0) {
+        printf("  waiting up to %.1fs for a stable AVI InfoFrame...\n", waitMs / 1000.0);
+        cs = sourceColourSpace(waitMs);
+    } else {
+        // Force modes still try a quick read for logging, but do not block.
+        cs = sourceColourSpace(500);
+    }
     static const char* names[] = { "RGB", "YCbCr 4:2:2", "YCbCr 4:4:4", "reserved" };
     if (cs >= 0) printf("  source InfoFrame: %s (p2 48 = %02x)\n", names[cs], vidRead(2, 0x48));
     else         printf("  no AVI InfoFrame from the source (no signal yet?)\n");
@@ -720,6 +792,115 @@ static int phaseColour(int mode) {
     printf("  set for %s input%s\n", rgb ? "RGB" : "YCbCr", bad ? "" : ", read back ok");
     if (bad) printf("  %d registers did not hold\n", bad);
     return bad ? 3 : 0;
+}
+
+// After the FX3 is open: success if the MCU answers, otherwise run the vendor
+// wake (0xC2/…) which is what brings the Nuvoton up after a cold plug.
+// Returns 0 ok, -1 MCU still silent after wake, -2 FX3 itself timed out on
+// 0xC2 (needs a physical USB power cycle — soft reset cannot recover).
+static int ensureMcuAwake() {
+    if (mcuRead(0x0e) >= 0) return 0;
+    printf("  MCU silent — running wake (0xC2/0xC7/GPIO)\n");
+    if (phaseWake() < 0) {
+        // phaseWake prints the failing op; a timeout on 0xC2 means the FX3
+        // control endpoint is dead, not just the MCU.
+        return -2;
+    }
+    return mcuRead(0x0e) >= 0 ? 0 : -1;
+}
+
+static void printLinkSpeed() {
+    UInt8 speed = 0; (*gDev)->GetDeviceSpeed(gDev, &speed);
+    static const char* sn[] = { "low", "full", "high (USB 2.0)", "SuperSpeed", "SuperSpeed+" };
+    printf("  link speed %s\n", speed < 5 ? sn[speed] : "?");
+    if (speed < 3)
+        printf("  WARNING: not a SuperSpeed link. Alt 2 does not exist at USB 2.0.\n");
+}
+
+// Software unplug/replug via IOKit. Restores the cold-plug state that
+// cold-init-replay assumes. After re-enumerate the FX3 is back but the MCU is
+// usually still dormant — wake brings it up. If 0xC2 times out, the FX3 is
+// wedged and only a physical USB power cycle helps.
+static int phaseReset(int waitMs = 12000) {
+    printf("\n-- USB re-enumerate (software unplug/replug) --\n");
+    if (gIf) {
+        (*gIf)->USBInterfaceClose(gIf);
+        (*gIf)->Release(gIf);
+        gIf = nullptr;
+    }
+    IOReturn r = (*gDev)->USBDeviceReEnumerate(gDev, 0);
+    printf("  USBDeviceReEnumerate(0) -> 0x%08x %s\n", r, ioerr(r));
+    // Handle is invalid after re-enumerate whether or not the call reported ok.
+    (*gDev)->USBDeviceClose(gDev);
+    (*gDev)->Release(gDev);
+    gDev = nullptr;
+
+    const int stepMs = 250;
+    int steps = waitMs / stepMs;
+    if (steps < 1) steps = 1;
+    int wakeTries = 0;
+    for (int i = 0; i < steps; i++) {
+        usleep((useconds_t)stepMs * 1000);
+        if (!openDevice(true)) continue;
+        usleep(300000);
+        int aw = ensureMcuAwake();
+        if (aw == 0) {
+            printf("  card back after %.1fs, MCU answering\n",
+                   (i * stepMs + 300) / 1000.0);
+            printLinkSpeed();
+            return 0;
+        }
+        if (aw == -2) {
+            printf("  FX3 timed out on 0xC2 — soft reset cannot recover.\n");
+            printf("  Unplug the HD60 S USB cable, plug it back in, then:\n");
+            printf("      ./start restart\n");
+            return 2;
+        }
+        if (++wakeTries >= 2) {
+            printf("  MCU still silent after wake — needs a physical USB power cycle.\n");
+            printf("  Unplug the HD60 S USB cable, plug it back in, then:\n");
+            printf("      ./start restart\n");
+            return 2;
+        }
+        printf("  device visible but MCU still silent after wake, releasing and retrying\n");
+        releaseDevice();
+    }
+    printf("  card did not come back with an answering MCU within %.1fs\n", waitMs / 1000.0);
+    printf("  Unplug the HD60 S USB cable, plug it back in, then ./start restart\n");
+    return 2;
+}
+
+// Wake + colour for passthrough. Skips the full cold-init replay (that path
+// resets the TX mid-way; use `replay` when you need capture).
+static int phaseUp() {
+    printf("\n-- up: wake + colour (no cold-init replay) --\n");
+    if (mcuRead(0x0e) < 0) {
+        if (phaseWake() < 0) return 2;
+    } else {
+        printf("  MCU already answering, skipping wake\n");
+    }
+    usleep(500000);   // front end needs a moment after wake before InfoFrame
+    int rc = phaseColour(0, 8000);
+    if (rc == 1) {
+        printf("  no InfoFrame yet; retrying colour in 2s\n");
+        usleep(2000000);
+        rc = phaseColour(0, 5000);
+        if (rc == 1) {
+            printf("  up complete; colour deferred until a source is present\n");
+            return 0;
+        }
+    }
+    return rc;
+}
+
+// USB re-enumerate + up. Prefer ./start up when the card is already awake.
+static int phaseRestart() {
+    int rc = phaseReset();
+    if (rc != 0) {
+        printf("  reset did not restore the card; not continuing\n");
+        return rc;
+    }
+    return phaseUp();
 }
 
 // Read-only. Compare our register state against the state the vendor driver's
@@ -850,8 +1031,14 @@ static int phaseReplay(const char* path, int maxOps) {
         unsigned br = (unsigned)strtol(breq, nullptr, 16);
         unsigned v  = (unsigned)strtol(wv,   nullptr, 16);
         unsigned ix = (unsigned)strtol(wi,   nullptr, 16);
-        // standard requests: the host stack owns these
-        if (br == 0x06 || br == 0x00 || br == 0x0b || br == 0x31) { skipped++; continue; }
+        // Standard USB requests: the host stack owns these. The capture also
+        // has CLEAR/SET_FEATURE (0x01/0x03), SET_CONFIGURATION (0x09) and
+        // SET_SEL (0x30); replaying them as vendor transfers always fails and
+        // is not part of the card bring-up.
+        if (br == 0x06 || br == 0x00 || br == 0x0b || br == 0x31 ||
+            br == 0x01 || br == 0x03 || br == 0x09 || br == 0x30) {
+            skipped++; continue;
+        }
         uint8_t buf[72]; memset(buf, 0, sizeof buf);
         if (len > (int)sizeof buf) len = sizeof buf;
         bool isIn = !strcmp(dir, "IN");
@@ -876,6 +1063,13 @@ static int phaseReplay(const char* path, int maxOps) {
     fclose(f);
     printf("  replayed %d ops: %d OUT, %d IN, %d standard skipped, %d failed\n",
            n, out, in, skipped, failed);
+    // Cold init leaves IT66121 0x20 = 0x01 (around op 2667). That locks the
+    // sink but blanks the picture; clear it. See docs/RGB_COLOUR.md.
+    if (n >= 2667) {
+        int was = mcuRead(0x20);
+        mcuWrite(0x20, 0x00);
+        printf("  TX 0x20: was 0x%02x, now 0x%02x\n", was, mcuRead(0x20));
+    }
     return 0;
 }
 
@@ -1194,9 +1388,18 @@ static void usage() {
 "  vidw PAGE REG VAL     write one video front end register.\n"
 "  sinkedid              read the downstream display's EDID through the MCU\n"
 "                        I2C proxy, as the vendor does after init.\n"
-"  replay FILE [N]       replay a --seq capture verbatim, reads included.\n"
 "  colour [rgb|ycbcr]    set the front end colour conversion from the source's\n"
-"                        AVI InfoFrame, or force it. Run after the cold init.\n"
+"                        AVI InfoFrame, or force it. Waits for a stable InfoFrame\n"
+"                        in auto mode. Usually run via ./start up after wake.\n"
+"  txdump                read-only. Dump IT66121 (HDMI transmitter) bank 0 via\n"
+"                        the MCU I2C proxy (mcuRead 0x00..0xff).\n"
+"  reset                 USB re-enumerate: software unplug/replug, then wake the\n"
+"                        MCU. Use when the FX3/MCU is wedged.\n"
+"  up                    wake (if needed) + colour. Preferred bring-up: keeps a\n"
+"                        live passthrough. Do NOT use full replay for picture.\n"
+"  restart               reset + up. Soft recovery without a cable yank.\n"
+"  replay FILE [N]       verbatim cold-init capture. Needed for capture. Clears\n"
+"                        TX 0x20 afterwards (left at 0x01 the TV stays black).\n"
 "  audio [secs]          read interface 1's interrupt endpoint, looking for the\n"
 "                        audio path.\n"
 "  vdiff                 read-only. Our register state against the vendor's\n"
@@ -1315,6 +1518,12 @@ int main(int argc, char** argv) {
         if (argc >= 3 && !strcmp(argv[2], "rgb"))   mode = 1;
         if (argc >= 3 && !strcmp(argv[2], "ycbcr")) mode = 2;
         rc = phaseColour(mode);
+    } else if (!strcmp(cmd, "reset")) {
+        rc = phaseReset();
+    } else if (!strcmp(cmd, "up")) {
+        rc = phaseUp();
+    } else if (!strcmp(cmd, "restart")) {
+        rc = phaseRestart();
     } else if (!strcmp(cmd, "audio")) {
         rc = phaseAudio(secs);
     } else if (!strcmp(cmd, "vdiff")) {
@@ -1339,7 +1548,7 @@ int main(int argc, char** argv) {
     } else if (!strcmp(cmd, "arm") || !strcmp(cmd, "stream")) {
         if (mcuRead(0x0e) < 0) {
             printf("  MCU is not answering. Nothing to arm.\n");
-            (*gDev)->USBDeviceClose(gDev); return 2;
+            releaseDevice(); return 2;
         }
         if (prologue) phasePrologue();
         if (maintain) phaseMaintain();
@@ -1359,7 +1568,6 @@ int main(int argc, char** argv) {
     } else { usage(); rc = 1; }
 
 done:
-    if (gIf) (*gIf)->USBInterfaceClose(gIf);
-    (*gDev)->USBDeviceClose(gDev);
+    releaseDevice();
     return rc;
 }

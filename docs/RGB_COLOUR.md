@@ -1,9 +1,8 @@
 # RGB sources: green passthrough and capture (issue #1)
 
-Bench session 2026-11-10 on an HD60 S (`0fd9:0074`) with a PS5 on HDMI in and a
-Toshiba TV on HDMI out. The card was on a USB 2.0 link through a dock, so
-control transfers worked but isochronous capture did not. Everything below was
-checked on the TV picture, not in OBS.
+Bench on an HD60 S (`0fd9:0074`) with a PS5 on HDMI in (HDCP off). Early runs
+were on USB 2.0 so only the TV picture was checked; later runs on SuperSpeed
+also checked capture.
 
 ## Summary
 
@@ -11,13 +10,37 @@ checked on the TV picture, not in OBS.
   init leaves the video front end's colour matrix at identity. The HDMI
   transmitter and the capture path both expect YCbCr from the front end.
 - Writing `p0 0x92 = 0x40` plus the vendor's BT.709 RGB to YCbCr matrix into
-  `p0 0x93..0xAA` turned a green TV picture normal. Seen once, from a green
-  start.
-- `./start colour` now does this automatically from the source's AVI InfoFrame,
-  and `hd60s-obs --init` runs it after the replay.
-- **Open:** after that one good result, every following run gave a black
-  picture with the signal still present (not "No signal"), whatever the colour
-  settings. Not explained yet. See the last section.
+  `p0 0x93..0xAA` turns a green TV picture normal.
+- `./start colour` does this from the source's AVI InfoFrame (waits for a
+  stable InfoFrame in auto mode). `./start up` is wake + colour. `./start
+  restart` is USB re-enumerate + up. `hd60s-obs --init` runs cold-init replay
+  then colour (capture needs the replay; wake+colour alone streams 0 bytes).
+- Leave OBS **Input colour** on **YCbCr**. The RGB option is legacy software
+  undo for inits that skipped hardware CSC; using both corrects twice.
+- Capture needs SuperSpeed. About 258 MB/s at 1080p60 after replay + colour.
+  USB 2.0 is fine for control / passthrough work only.
+- Full cold-init replay used to leave the TV black with a lock. That was TX
+  `0x20 = 0x01`; `./start replay` clears it. See below.
+
+## Soft bring-up
+
+**Picture only (no capture):**
+
+    ./start up         # wake (if needed) + colour from AVI InfoFrame
+    ./start restart    # USB re-enumerate + up, when the card is wedged
+
+**Capture / OBS:**
+
+    ./start replay data/cold-init-replay.txt
+    ./start colour
+
+Op 35 of the cold init writes IT66121 `0x04 = 0x3d` (TX reset). The TV goes
+"No signal" mid-replay; finishing the replay + colour brings capture up, and
+the `0x20` clear stops the TV staying black afterwards.
+
+Re-enumerate without wake restores hardware bypass so you can check menus
+without unplugging HDMI. `./start reset` re-enumerates then wakes. If `0xC2`
+times out, power-cycle the USB cable once.
 
 ## The I2C proxy is not just the MCU
 
@@ -31,7 +54,7 @@ I2C address:
 | `9d 01 REG` then IN | read, video front end (I2C 0x9C) |
 
 So `mcuRead`/`mcuWrite` in `start.cpp` are really IT66121 accesses. The chip ID
-at TX regs `0x00..0x03` reads `54 49 12 16` (ITE, 0x1612). The new read-only
+at TX regs `0x00..0x03` reads `54 49 12 16` (ITE, 0x1612). The read-only
 `./start txdump` prints TX bank 0.
 
 ## What the cold init does to the transmitter
@@ -76,8 +99,8 @@ Cold init leaves (identity with range scaling, correct for YCbCr in):
     0dc0 0000 0000 | 0000 0df6 0000 | 0000 0000 0dc0 | 2000 0000 2000
     p0 0x92 = 0x62
 
-The vendor's RGB values (`kTiming` in `start.cpp`) decode as BT.709 full to
-limited:
+The vendor's RGB values (`kCscRgb` in `start.cpp`, also used by `./start format`)
+decode as BT.709 full to limited:
 
     R: Cr  0.439  Y 0.185  Cb -0.100
     G: Cr -0.398  Y 0.624  Cb -0.338
@@ -91,8 +114,7 @@ init in bits 0x20 and 0x02, and at least one of them is the YCbCr input /
 chroma offset mode. Which bit does what has not been isolated.
 
 The PS5 sends limited RGB and the matrix is the full-range one, so blacks may be
-slightly lifted and whites slightly dim. That was not visible on the TV and has
-not been measured.
+slightly lifted and whites slightly dim. Not visible here and not measured.
 
 ## Bench log
 
@@ -113,37 +135,28 @@ not been measured.
 Between 9 and 11 the front end matrix and `0x92` read back as intended, the PS5
 stayed locked at 1080p (H total 2200, V total 1125), the InfoFrame read RGB, and
 the TX looked healthy (`c1 = 80`, so AVMute off; `61 = 00`; `04 = 00`;
-`70 = 40`; `72 = 03`).
+`70 = 40`; `72 = 03`). That black was the `0x20` issue below, not the matrix.
 
-## Open: black picture after the cold init
+## Black after cold init: TX `0x20`
 
-The black has a signal present and doesn't depend on the matrix settings. It
-was seen with HDCP in an unknown state (2) and, after the fix, with the HDCP
-setting believed off (9 to 11). Candidates, untested:
+Cold init writes IT66121 `0x20 = 0x01` around replay op 2667. With that set the
+TX locks but the picture stays black. Clearing `0x20` to `0x00` restores it.
+Capture rate is the same either way.
 
-1. The PS5 is back to HDCP, or only drops it for a while after the setting is
-   toggled. HDCP content through the front end to TX path would give black,
-   while the dormant hardware bypass passes it fine. Check the PS5 setting,
-   then repeat run 6 (power cycle, replay only). Green means HDCP; black means
-   timing.
-2. Timing. In run 8 the matrix went in a minute or so after the replay, with
-   the TV already showing green. In runs 9 and 10 `colour` ran straight after.
-   Try a delay, or wait until the front end reports a stable lock first.
-3. A cold init on a card that is already initialised (run 9, and the double
-   replay earlier) always gave black. Separate from the colour fix, but it
-   matters for OBS restarting the source without a replug.
+| stop after | notes | TV |
+|---|---|---|
+| 2460 | | No signal |
+| 2464 (`0x61 = 00`) | AVMute still on (`c1 = 01`) | black |
+| 2464 + unmute | | normal |
+| 2667 (`0x20 = 01`) + unmute | | normal |
+| 2668 (`0x21 = 01`) + unmute | | black |
+| full replay | `0x20` left at `01` | black |
+| full replay + `0x20 = 00` | what `./start replay` does now | **normal** |
 
-Front end registers that changed between an earlier session and run 11
-(`p1 0x08..0x11`, `p1 0x34` 90 to 40, `p2 0x0d`, `p2 0x0e`, `p2 0x40`) may be
-link or HDCP status and are worth correlating with good and bad runs.
+`sinkedid` does not fix it.
 
 ## Not verified
 
-- OBS capture. The card was on USB 2.0, so no stream. The capture path should
-  get correct YCbCr now, but that is a reasonable inference, not a result.
-- The plugin's "Input colour: RGB" option from PR #3 is a software correction for
-  the old green. With the hardware fix in place it would correct twice. Anyone
-  who set RGB should go back to YCbCr. The option and the README text still need
-  revisiting once capture is checked.
-- A Switch. ley10n's source. Expected to behave like the PS5 (RGB, no HDCP on
-  the home screen).
+- OBS plugin UI end-to-end with Input colour YCbCr (raw SuperSpeed stream after
+  replay + colour is fine).
+- A Switch. Same RGB path as the PS5; waiting on confirmation in #1.
