@@ -5,7 +5,7 @@
 
 #define VID 0x0FD9
 
-static const UInt16 kPIDs[] = { 0x004f, 0x005e, 0x0074 };
+static const UInt16 kPIDs[] = { 0x004f, 0x005e, 0x0074, 0x0076 };
 
 static inline bool isHD60S(UInt16 v, UInt16 p) {
     if (v != VID) return false;
