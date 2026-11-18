@@ -24,7 +24,7 @@ replay/`up`/`bringup` (clear AVMute, clear sticky `0x20`, unstick `0x04`),
 | Progress doc | this file |
 | Auto-colour when source appears after bring-up | coded; needs bench |
 | Cold-init shrink (inventory) | done — see below |
-| Cold-init shrink (bench bisect) | next: try cutoff ~op 3000 |
+| Cold-init shrink (bench bisect) | **3000 ops enough** (258 MB/s); default bringup |
 
 ## Session log
 
@@ -53,12 +53,14 @@ replay/`up`/`bringup` (clear AVMute, clear sticky `0x20`, unstick `0x04`),
     cutoff near op 3000.
 - All **335 TX (`0x9a`) writes** fall in replay ops **77–2996**. Ops
   3000–10000 have **zero** TX writes — FE/`0x509c` + MCU empty polling.
-- Bench attempt `./start replay … 3000`: TX normalize still saw `0x20=0x01`
-  and cleared it (so sticky write is inside the first 3k). No InfoFrame /
-  no isoc data — but the console had no signal for a full bringup either
-  (60s wait timed out). **Cutoff not proven yet; needs a live source.**
-- Auto-colour wait exercised: printed 5s ticks for 60s, then deferred
-  cleanly. Ready to re-test when a game is on.
+- Earlier `replay … 3000` with no HDMI: inconclusive.
+- With Zelda title live: `replay … 3000` + `colour` + `stream 3` →
+  **258.4 MB/s**, 100% isoc fill. TX still had `0x20=0x01` then normalize.
+- Default `./start bringup` / `restart` now use **first 3000 ops**
+  (`kColdInitEnoughOps`). Full file: `./start bringup FILE 0` or
+  `./start replay FILE`.
+- Picture A/B: user said Elgato matches direct again after re-plug;
+  limited-range matrix experiment parked.
 
 ## Bench checklist (when the card is plugged in)
 
@@ -77,8 +79,7 @@ replay/`up`/`bringup` (clear AVMute, clear sticky `0x20`, unstick `0x04`),
 
 ## Ideas (not committed)
 
-- If 3000 works with a live source: ship a trimmed replay (or default
-  `bringup` cutoff) and keep the full file for recovery.
-- If 3000 fails: bisect between 3000 and 10000 — something in the FE
-  poll/table region is still required for isoc.
-- Never ship a cut that blanks the TV or empties the isoc pipe.
+- Optional: write a trimmed `data/cold-init-replay-short.txt` so the
+  default path does not scan the idle tail of the full log.
+- If anyone hits empty isoc after short bringup: `./start bringup FILE 0`.
+- Limited-range CSC matrix if blown-out reports return on RGB sources.

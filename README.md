@@ -51,8 +51,11 @@ Picture only (no capture):
 Capture / OBS needs the cold-init replay first (wake+colour alone leaves the
 isoc pipe empty):
 
-    ./start bringup    # replay + colour
+    ./start bringup    # first ~3000 cold-init ops + colour (~enough for capture)
     ./hd60s-obs
+
+`./start bringup data/cold-init-replay.txt 0` runs the full captured init if a
+short bring-up ever fails.
 
 `hd60s-obs --udp` skips the plugin and sends mpegts to udp://127.0.0.1:9600 for
 an OBS media source instead. `hd60s-obs --init` runs `./start bringup`.

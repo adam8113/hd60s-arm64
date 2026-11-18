@@ -48,7 +48,11 @@ static bool gNoP80 = false;
 static bool gArm = false, gPost = false;
 
 static int phaseReplay(const char* path, int maxOps);
-static int phaseBringup(const char* replayPath);
+static int phaseBringup(const char* replayPath, int maxOps);
+
+// First ~3000 replay ops cover all TX programming; the rest of the capture
+// log is FE idle polling. Bench 2026-11-18: 3000 + colour => 258 MB/s capture.
+static const int kColdInitEnoughOps = 3000;
 
 // ---------------------------------------------------------------- transport
 
@@ -1053,13 +1057,16 @@ static int phaseRestart() {
     printf("  re-running wake after re-enumerate\n");
     if (phaseWake() < 0) return 2;
     usleep(2000000);
-    return phaseBringup("data/cold-init-replay.txt");
+    return phaseBringup("data/cold-init-replay.txt", kColdInitEnoughOps);
 }
 
 // Capture bring-up in one shot: cold-init replay + colour.
-static int phaseBringup(const char* replayPath) {
-    printf("\n-- bringup: replay + colour --\n");
-    int rc = phaseReplay(replayPath, 0);
+// maxOps <= 0 means the whole file; default bringup uses kColdInitEnoughOps.
+static int phaseBringup(const char* replayPath, int maxOps) {
+    printf("\n-- bringup: replay + colour");
+    if (maxOps > 0) printf(" (first %d ops)", maxOps);
+    printf(" --\n");
+    int rc = phaseReplay(replayPath, maxOps);
     if (rc != 0) return rc;
     rc = phaseColour(0, 8000);
     if (rc == 1) {
@@ -1571,8 +1578,9 @@ static void usage() {
 "                        yank (replay+colour after re-enumerate).\n"
 "  replay FILE [N]       verbatim cold-init capture. Needed for capture. Then\n"
 "                        normalizes TX (clear AVMute, clear 0x20, unstick 0x04).\n"
-"  bringup [FILE]        replay + colour. Default FILE is data/cold-init-replay.txt.\n"
-"                        What hd60s-obs --init runs. Re-normalizes TX after colour.\n"
+"  bringup [FILE] [N]    replay + colour. Default FILE is data/cold-init-replay.txt.\n"
+"                        Default N is 3000 (enough for capture); N=0 is the full\n"
+"                        file. What hd60s-obs --init runs.\n"
 "  audio [secs]          read interface 1's interrupt endpoint, looking for the\n"
 "                        audio path.\n"
 "  vdiff                 read-only. Our register state against the vendor's\n"
@@ -1698,9 +1706,11 @@ int main(int argc, char** argv) {
     } else if (!strcmp(cmd, "restart")) {
         rc = phaseRestart();
     } else if (!strcmp(cmd, "bringup")) {
-        const char* path = (argc >= 3 && argv[2][0] != '-') ? argv[2]
-                                                           : "data/cold-init-replay.txt";
-        rc = phaseBringup(path);
+        const char* path = "data/cold-init-replay.txt";
+        int maxOps = kColdInitEnoughOps;
+        if (argc >= 3 && argv[2][0] != '-') path = argv[2];
+        if (argc >= 4 && argv[3][0] != '-') maxOps = atoi(argv[3]);
+        rc = phaseBringup(path, maxOps);
     } else if (!strcmp(cmd, "audio")) {
         rc = phaseAudio(secs);
     } else if (!strcmp(cmd, "vdiff")) {

@@ -33,7 +33,8 @@ also checked capture.
 
 **Capture / OBS:**
 
-    ./start bringup    # replay + colour (same as hd60s-obs --init)
+    ./start bringup    # first 3000 cold-init ops + colour (hd60s-obs --init)
+    ./start bringup data/cold-init-replay.txt 0   # full replay if needed
 
 If the console is asleep during `up` / `bringup` / `restart`, the command keeps
 watching for an AVI InfoFrame for up to 60s and applies colour when HDMI comes
