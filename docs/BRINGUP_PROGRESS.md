@@ -23,8 +23,8 @@ replay/`up`/`bringup` (clear AVMute, clear sticky `0x20`, unstick `0x04`),
 | Repo hygiene (gitignore dumps, drop stale branch) | done 2026-11-18 |
 | Progress doc | this file |
 | Auto-colour when source appears after bring-up | coded; needs bench |
-| Cold-init shrink (inventory) | started |
-| Cold-init shrink (bench bisect) | not started |
+| Cold-init shrink (inventory) | done — see below |
+| Cold-init shrink (bench bisect) | next: try cutoff ~op 3000 |
 
 ## Session log
 
@@ -42,9 +42,23 @@ replay/`up`/`bringup` (clear AVMute, clear sticky `0x20`, unstick `0x04`),
     the end (cleared by TX normalize).
 - Added `phaseColourWhenSource` (60s poll) on `up` / `bringup` after the
   short colour retries fail — applies CSC when HDMI returns.
-- Next bench: `./start restart` with console asleep, then wake a game within
-  60s and confirm colour applies without a manual `./start colour`. Then
-  start cold-init bisect with `./start replay FILE N` on SuperSpeed.
+- Auto-colour wait coded (see above). Still needs an asleep→wake bench.
+- Cold-init phase map (replay op index 1..10000):
+  - **1–500**: MCU bulk + empty (FX3/MCU bring-up).
+  - **500–1500**: heavy FE `0x509c` (tables / EDID-ish).
+  - **1500–3000**: TX read/write heavy (reset, AVMute, CSC, sticky `0x20`).
+  - **3000–10000**: almost pure repeating FE read + MCU empty + `0x509c` —
+    looks like an **idle poll loop captured into the log**, not unique init.
+    ~70% of the replay may be droppable if capture still works after a
+    cutoff near op 3000.
+- All **335 TX (`0x9a`) writes** fall in replay ops **77–2996**. Ops
+  3000–10000 have **zero** TX writes — FE/`0x509c` + MCU empty polling.
+- Bench attempt `./start replay … 3000`: TX normalize still saw `0x20=0x01`
+  and cleared it (so sticky write is inside the first 3k). No InfoFrame /
+  no isoc data — but the console had no signal for a full bringup either
+  (60s wait timed out). **Cutoff not proven yet; needs a live source.**
+- Auto-colour wait exercised: printed 5s ticks for 60s, then deferred
+  cleanly. Ready to re-test when a game is on.
 
 ## Bench checklist (when the card is plugged in)
 
@@ -52,13 +66,19 @@ replay/`up`/`bringup` (clear AVMute, clear sticky `0x20`, unstick `0x04`),
 ./start bringup          # expect TX normalize + colour if source is live
 ./start stream 3         # ~258 MB/s at 1080p60
 ./start up               # picture-only path
-./start restart          # with source off, then turn source on — colour should follow
+./start restart          # with source off, then turn source on within 60s
+
+# cold-init shrink probes (live HDMI required)
+./start replay data/cold-init-replay.txt 3000
+./start colour
+./start stream 3
+# if empty, try 4000 / 5000 / 7000 / full
 ```
 
 ## Ideas (not committed)
 
-- After deferred colour, poll AVI InfoFrame for up to N seconds (e.g. 60s)
-  and apply CSC when it appears; print a clear “waiting for HDMI…” line.
-- For shrink: keep wake + TX reset/unmute/CSC + FE arm + whatever the
-  isoc path needs; drop redundant EDID/DDC churn if capture still works.
+- If 3000 works with a live source: ship a trimmed replay (or default
+  `bringup` cutoff) and keep the full file for recovery.
+- If 3000 fails: bisect between 3000 and 10000 — something in the FE
+  poll/table region is still required for isoc.
 - Never ship a cut that blanks the TV or empties the isoc pipe.
