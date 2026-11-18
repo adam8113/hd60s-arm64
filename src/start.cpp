@@ -898,6 +898,32 @@ static int phaseColour(int mode, int waitMs = 8000) {
     return bad ? 3 : 0;
 }
 
+// Bring-up often finishes before the console wakes. Keep watching for an AVI
+// InfoFrame and apply CSC when one appears so the user does not have to run
+// ./start colour by hand.
+static int phaseColourWhenSource(int waitMs = 60000) {
+    printf("\n-- waiting for HDMI source (up to %.0fs) to apply colour --\n",
+           waitMs / 1000.0);
+    const int stepMs = 500;
+    int elapsed = 0;
+    int lastPrint = -1;
+    while (elapsed < waitMs) {
+        if (sourceColourSpace(400) >= 0) {
+            printf("  source appeared after %.1fs\n", elapsed / 1000.0);
+            return phaseColour(0, 2000);
+        }
+        int sec = elapsed / 1000;
+        if (sec != lastPrint && sec % 5 == 0) {
+            printf("  still no InfoFrame (%ds)...\n", sec);
+            lastPrint = sec;
+        }
+        usleep((useconds_t)stepMs * 1000);
+        elapsed += stepMs;
+    }
+    printf("  gave up waiting; run ./start colour when the source is on\n");
+    return 1;
+}
+
 // After the FX3 is open: success if the MCU answers, otherwise run the vendor
 // wake (0xC2/…) which is what brings the Nuvoton up after a cold plug.
 // Returns 0 ok, -1 MCU still silent after wake, -2 FX3 itself timed out on
@@ -1002,13 +1028,13 @@ static int phaseUp(int settleMs = 500) {
         printf("  no InfoFrame yet; retrying colour in 3s\n");
         usleep(3000000);
         rc = phaseColour(0, 8000);
-        if (rc == 1) {
-            normalizeTxOutput();
-            printf("  up complete; colour deferred until a source is present\n");
-            return 0;
-        }
+        if (rc == 1) rc = phaseColourWhenSource(60000);
     }
-    if (rc == 0) normalizeTxOutput();
+    if (rc == 0 || rc == 1) normalizeTxOutput();
+    if (rc == 1) {
+        printf("  up complete; colour still deferred\n");
+        return 0;
+    }
     return rc;
 }
 
@@ -1040,15 +1066,14 @@ static int phaseBringup(const char* replayPath) {
         printf("  no InfoFrame yet; retrying colour in 2s\n");
         usleep(2000000);
         rc = phaseColour(0, 5000);
-        if (rc == 1) {
-            // Replay already normalized TX; do it again in case colour path
-            // touched mute/reset, and so deferred-colour still leaves picture.
-            normalizeTxOutput();
-            printf("  colour deferred; run ./start colour once the source is on\n");
-            return 0;
-        }
+        if (rc == 1) rc = phaseColourWhenSource(60000);
     }
-    if (rc == 0) normalizeTxOutput();
+    // Replay already normalized TX; run again after colour (or after giving up).
+    if (rc == 0 || rc == 1) normalizeTxOutput();
+    if (rc == 1) {
+        printf("  colour still deferred; run ./start colour when the source is on\n");
+        return 0;
+    }
     return rc;
 }
 

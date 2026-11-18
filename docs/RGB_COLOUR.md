@@ -35,6 +35,10 @@ also checked capture.
 
     ./start bringup    # replay + colour (same as hd60s-obs --init)
 
+If the console is asleep during `up` / `bringup` / `restart`, the command keeps
+watching for an AVI InfoFrame for up to 60s and applies colour when HDMI comes
+back. Progress and leftover tasks: `docs/BRINGUP_PROGRESS.md`.
+
 Op 35 of the cold init writes IT66121 `0x04 = 0x3d` (TX SW-reset pulse; it
 should end at `0x04 = 0x1d`). The TV goes "No signal" mid-replay; finishing
 the replay + colour brings capture up, and TX normalize (unmute + `0x20`
