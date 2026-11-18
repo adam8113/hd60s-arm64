@@ -20,7 +20,9 @@ also checked capture.
 - Capture needs SuperSpeed. About 258 MB/s at 1080p60 after replay + colour.
   USB 2.0 is fine for control / passthrough work only.
 - Full cold-init replay used to leave the TV black with a lock. That was TX
-  `0x20 = 0x01`; `./start replay` clears it. See below.
+  `0x20 = 0x01`. After replay (and after `up` / `bringup`) we normalize the
+  TX: leave `0x04` at `0x1d` if stuck in the `0x3d` reset pulse, clear AVMute
+  (`0xc1=0`, `0xc6=0x03`), and clear `0x20`. See below.
 
 ## Soft bring-up
 
@@ -33,9 +35,10 @@ also checked capture.
 
     ./start bringup    # replay + colour (same as hd60s-obs --init)
 
-Op 35 of the cold init writes IT66121 `0x04 = 0x3d` (TX reset). The TV goes
-"No signal" mid-replay; finishing the replay + colour brings capture up, and
-the `0x20` clear stops the TV staying black afterwards.
+Op 35 of the cold init writes IT66121 `0x04 = 0x3d` (TX SW-reset pulse; it
+should end at `0x04 = 0x1d`). The TV goes "No signal" mid-replay; finishing
+the replay + colour brings capture up, and TX normalize (unmute + `0x20`
+clear + unstick `0x04`) stops the TV staying black afterwards.
 
 Re-enumerate without wake restores hardware bypass so you can check menus
 without unplugging HDMI. `./start reset` re-enumerates then wakes. If `0xC2`

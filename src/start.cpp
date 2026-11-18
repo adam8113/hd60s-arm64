@@ -103,6 +103,31 @@ static IOReturn mcuWrite(uint8_t reg, uint8_t val) {
     return ctl(0xC0, T_MCU, 0, k, 3, false);
 }
 
+// Leave the HDMI TX in a live-picture state after cold init: exit SW-reset,
+// clear AVMute, clear the sticky 0x20 bit that blanks the sink. Harmless when
+// already good.
+static void normalizeTxOutput() {
+    if (mcuRead(0x0e) < 0) {
+        printf("  TX normalize skipped (MCU not answering)\n");
+        return;
+    }
+    mcuWrite(0x0f, 0x00); // bank 0
+    int r04 = mcuRead(0x04);
+    int rc1 = mcuRead(0xc1);
+    int r20 = mcuRead(0x20);
+    printf("  TX before: 0x04=0x%02x 0xc1=0x%02x 0x20=0x%02x\n",
+           r04 < 0 ? 0xff : r04, rc1 < 0 ? 0xff : rc1, r20 < 0 ? 0xff : r20);
+    if (r04 == 0x3d) {
+        // Reset pulse is 0x3d then 0x1d. Stuck 0x3d = no signal.
+        mcuWrite(0x04, 0x1d);
+    }
+    mcuWrite(0xc1, 0x00);
+    mcuWrite(0xc6, 0x03);
+    mcuWrite(0x20, 0x00);
+    printf("  TX after:  0x04=0x%02x 0xc1=0x%02x 0x20=0x%02x\n",
+           mcuRead(0x04), mcuRead(0xc1), mcuRead(0x20));
+}
+
 // Video front end. Register 0x00 on the chip is the page select. The MCU acts
 // as the I2C master: 0x9d proxies a read of the video chip's current page.
 static IOReturn vidPage(uint8_t page) {
@@ -978,10 +1003,12 @@ static int phaseUp(int settleMs = 500) {
         usleep(3000000);
         rc = phaseColour(0, 8000);
         if (rc == 1) {
+            normalizeTxOutput();
             printf("  up complete; colour deferred until a source is present\n");
             return 0;
         }
     }
+    if (rc == 0) normalizeTxOutput();
     return rc;
 }
 
@@ -1014,10 +1041,14 @@ static int phaseBringup(const char* replayPath) {
         usleep(2000000);
         rc = phaseColour(0, 5000);
         if (rc == 1) {
+            // Replay already normalized TX; do it again in case colour path
+            // touched mute/reset, and so deferred-colour still leaves picture.
+            normalizeTxOutput();
             printf("  colour deferred; run ./start colour once the source is on\n");
             return 0;
         }
     }
+    if (rc == 0) normalizeTxOutput();
     return rc;
 }
 
@@ -1181,13 +1212,9 @@ static int phaseReplay(const char* path, int maxOps) {
     fclose(f);
     printf("  replayed %d ops: %d OUT, %d IN, %d standard skipped, %d failed\n",
            n, out, in, skipped, failed);
-    // Cold init leaves IT66121 0x20 = 0x01 (around op 2667). That locks the
-    // sink but blanks the picture; clear it. See docs/RGB_COLOUR.md.
-    if (n >= 2667) {
-        int was = mcuRead(0x20);
-        mcuWrite(0x20, 0x00);
-        printf("  TX 0x20: was 0x%02x, now 0x%02x\n", was, mcuRead(0x20));
-    }
+    // Cold init leaves TX 0x20 = 0x01 (around op 2667) and may leave AVMute
+    // or a stuck 0x04=0x3d reset pulse on truncated runs. Normalize always.
+    normalizeTxOutput();
     return 0;
 }
 
@@ -1517,10 +1544,10 @@ static void usage() {
 "                        live passthrough. Do NOT use full replay for picture.\n"
 "  restart               reset + wake + bringup. Soft recovery without a cable\n"
 "                        yank (replay+colour after re-enumerate).\n"
-"  replay FILE [N]       verbatim cold-init capture. Needed for capture. Clears\n"
-"                        TX 0x20 afterwards (left at 0x01 the TV stays black).\n"
+"  replay FILE [N]       verbatim cold-init capture. Needed for capture. Then\n"
+"                        normalizes TX (clear AVMute, clear 0x20, unstick 0x04).\n"
 "  bringup [FILE]        replay + colour. Default FILE is data/cold-init-replay.txt.\n"
-"                        What hd60s-obs --init runs.\n"
+"                        What hd60s-obs --init runs. Re-normalizes TX after colour.\n"
 "  audio [secs]          read interface 1's interrupt endpoint, looking for the\n"
 "                        audio path.\n"
 "  vdiff                 read-only. Our register state against the vendor's\n"
